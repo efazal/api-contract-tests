@@ -758,11 +758,21 @@ class TestPrepareTools:
     def test_preparation_environment_is_isolated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        # Everything except the allowlist (PATH, and the TLS trust store
+        # locations for online preparation) is dropped, not filtered.
         monkeypatch.setenv("HELM_DRIVER", "configmaps")
         monkeypatch.setenv("KUSTOMIZE_PLUGIN", "x")
         monkeypatch.setenv("GOPROXY", "https://proxy.example.invalid")
         monkeypatch.setenv("GOPRIVATE", "*")
         monkeypatch.setenv("GOSUMDB", "off")
+        monkeypatch.setenv("GOFLAGS", "-mod=vendor")
+        monkeypatch.setenv("GOOS", "windows")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "akia-sentinel")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp-sentinel")
+        monkeypatch.setenv("KUBECONFIG", "/tmp/kubeconfig-sentinel")
+        monkeypatch.setenv("MANIFEST_TEST_SENTINEL", "ambient")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.invalid:3128")
+        monkeypatch.setenv("NO_PROXY", "example.invalid")
         cache = tmp_path / "cache"
         runner = FakeRunner()
         monkeypatch.setattr(renderers, "_run", runner)
@@ -771,9 +781,22 @@ class TestPrepareTools:
         env = runner.prepare_calls[0]["env"]
         assert env["GOSUMDB"] == "sum.golang.org"
         assert env["GOPRIVATE"] == ""
-        assert env["GOPROXY"] == "https://proxy.example.invalid"
+        # Ambient Go/proxy configuration is not inherited: preparation
+        # resolves modules through Go's own defaults under checksum
+        # verification, not through a caller-supplied proxy.
+        assert "GOPROXY" not in env
+        assert env["GOFLAGS"] == ""
+        assert "GOOS" not in env
         assert "HELM_DRIVER" not in env
         assert "KUSTOMIZE_PLUGIN" not in env
+        assert "AWS_SECRET_ACCESS_KEY" not in env
+        assert "GITHUB_TOKEN" not in env
+        assert "KUBECONFIG" not in env
+        assert "MANIFEST_TEST_SENTINEL" not in env
+        assert "HTTPS_PROXY" not in env
+        assert "NO_PROXY" not in env
+        # PATH is inherited explicitly: it locates the pinned go toolchain.
+        assert env["PATH"] == os.environ["PATH"]
         assert env["GOWORK"] == "off"
         assert env["GOENV"] == "off"
         assert env["GOTOOLCHAIN"] == "local"
@@ -782,6 +805,36 @@ class TestPrepareTools:
         assert env["GOPATH"] == str(cache / "gopath")
         assert env["HOME"] != os.environ["HOME"]
         assert not Path(env["HOME"]).exists()
+
+    def test_preparation_allows_tls_trust_locations_only_online(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # SSL_CERT_FILE/SSL_CERT_DIR are inherited for online module
+        # fetching only; rendering (offline) drops them with everything
+        # else outside the allowlist.
+        monkeypatch.setenv("SSL_CERT_FILE", "/tmp/ca-sentinel.crt")
+        cache = tmp_path / "cache"
+        runner = FakeRunner()
+        monkeypatch.setattr(renderers, "_run", runner)
+        renderers.prepare_tools(config_with(["helm"]), cache)
+        online_env = runner.prepare_calls[0]["env"]
+        offline_env = runner.prepare_calls[1]["env"]
+        assert online_env["SSL_CERT_FILE"] == "/tmp/ca-sentinel.crt"
+        assert "SSL_CERT_FILE" not in offline_env
+
+    def test_preparation_runs_in_an_isolated_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cache = tmp_path / "cache"
+        runner = FakeRunner()
+        monkeypatch.setattr(renderers, "_run", runner)
+        renderers.prepare_tools(config_with(["helm"]), cache)
+        homes = {call["cwd"] for call in runner.calls if call["cwd"] is not None}
+        assert len(homes) == 1
+        working_dir = Path.cwd()
+        assert all(
+            not Path(cwd).resolve().is_relative_to(working_dir) for cwd in homes
+        )
 
     def test_prepares_both_renderers_with_provenance(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -1387,11 +1440,19 @@ class TestKustomizeRender:
         monkeypatch.setenv("GOPROXY", "https://proxy.example.invalid")
         monkeypatch.setenv("GOPRIVATE", "*")
         monkeypatch.setenv("GONOPROXY", "example.invalid")
+        monkeypatch.setenv("AWS_SESSION_TOKEN", "sentinel")
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp-sentinel")
+        monkeypatch.setenv("KUBECONFIG", "/tmp/kubeconfig-sentinel")
+        monkeypatch.setenv("MANIFEST_TEST_SENTINEL", "ambient")
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.invalid:3128")
+        monkeypatch.setenv("SSL_CERT_FILE", "/tmp/ca-sentinel.crt")
         repo = build_repo(tmp_path, copies={"kustomize": "manifests"})
         records, _ = snap_candidate(repo, tmp_path)
         _, runner = run_render(
             monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
         )
+        assert len(runner.render_calls) == 2
+        working_dir = Path.cwd()
         for call in runner.render_calls:
             env = call["env"]
             assert env["GOPROXY"] == (
@@ -1403,7 +1464,20 @@ class TestKustomizeRender:
             assert env["GONOSUMDB"] == ""
             assert env["GOTOOLCHAIN"] == "local"
             assert "KUSTOMIZE_PLUGIN" not in env
+            assert "AWS_SESSION_TOKEN" not in env
+            assert "GITHUB_TOKEN" not in env
+            assert "KUBECONFIG" not in env
+            assert "MANIFEST_TEST_SENTINEL" not in env
+            assert "HTTP_PROXY" not in env
+            # TLS trust locations are preparation-only; rendering drops them.
+            assert "SSL_CERT_FILE" not in env
             assert env["HOME"] != os.environ["HOME"]
+            # Each render pass runs from its own isolated renderer home,
+            # never from the caller's working directory.
+            assert call["cwd"] is not None
+            assert Path(call["cwd"]) == Path(env["HOME"])
+            assert not Path(call["cwd"]).resolve().is_relative_to(working_dir)
+        assert runner.render_calls[0]["cwd"] != runner.render_calls[1]["cwd"]
 
     def test_remote_base_rejected(self, tmp_path: Path) -> None:
         for index, remote in enumerate((
@@ -1626,6 +1700,345 @@ class TestKustomizeRender:
         records, _ = snap_candidate(repo, tmp_path)
         with pytest.raises(RenderError, match="does not exist in the snapshot"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_deprecated_singular_env_reference_validated(self, tmp_path: Path) -> None:
+        # The deprecated singular env field holds one plain file path and is
+        # validated like the plural form; a missing file is a render error.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "configMapGenerator:\n  - name: cfg\n    env: absent.env\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_deprecated_singular_env_remote_rejected(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "secretGenerator:\n  - name: secret\n    env: https://example.invalid/a.env\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_literal_sources_with_url_values_stay_legal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Literals are data, not references: a URL-like value must not be
+        # rejected merely for containing a URL.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "resources: []\nconfigMapGenerator:\n  - name: cfg\n"
+                "    literals:\n      - endpoint=https://example.com/api\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        output, runner = run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+        assert output == b""
+        assert len(runner.render_calls) == 2
+
+    @pytest.mark.parametrize("kind,config", [
+        ("PatchTransformer", "apiVersion: builtin\nkind: PatchTransformer\npath: {ref}\n"),
+        ("PatchJson6902Transformer",
+         "apiVersion: builtin\nkind: PatchJson6902Transformer\npath: {ref}\n"
+         "target:\n  kind: Deployment\n  name: web\n"),
+        ("PatchStrategicMergeTransformer",
+         "apiVersion: builtin\nkind: PatchStrategicMergeTransformer\npaths:\n  - {ref}\n"),
+        ("ReplacementTransformer",
+         "apiVersion: builtin\nkind: ReplacementTransformer\nreplacements:\n"
+         "  - path: {ref}\n"),
+        ("ValueAddTransformer",
+         "apiVersion: builtin\nkind: ValueAddTransformer\ntargetFilePath: {ref}\n"
+         "targets:\n  - fieldPath: metadata/annotations/x\n"),
+        ("ConfigMapGenerator",
+         "apiVersion: builtin\nkind: ConfigMapGenerator\nmetadata:\n  name: cfg\n"
+         "files:\n  - {ref}\n"),
+        ("SecretGenerator",
+         "apiVersion: builtin\nkind: SecretGenerator\nmetadata:\n  name: secret\n"
+         "envs:\n  - {ref}\n"),
+    ])
+    def test_nested_plugin_remote_references_rejected(
+        self, tmp_path: Path, kind: str, config: str,
+    ) -> None:
+        # References nested inside generator/transformer plugin
+        # configurations are loader loads in the pinned kustomize; each of
+        # these must be rejected before any subprocess runs.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "transformers:\n  - transformers.yaml\n",
+            "manifests/overlays/prod/transformers.yaml":
+                config.format(ref="https://example.invalid/patch.yaml"),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    @pytest.mark.parametrize("kind,config", [
+        ("PatchTransformer", "apiVersion: builtin\nkind: PatchTransformer\npath: {ref}\n"),
+        ("PatchJson6902Transformer",
+         "apiVersion: builtin\nkind: PatchJson6902Transformer\npath: {ref}\n"
+         "target:\n  kind: Deployment\n  name: web\n"),
+        ("PatchStrategicMergeTransformer",
+         "apiVersion: builtin\nkind: PatchStrategicMergeTransformer\npaths:\n  - {ref}\n"),
+        ("ReplacementTransformer",
+         "apiVersion: builtin\nkind: ReplacementTransformer\nreplacements:\n"
+         "  - path: {ref}\n"),
+        ("ValueAddTransformer",
+         "apiVersion: builtin\nkind: ValueAddTransformer\ntargetFilePath: {ref}\n"
+         "targets:\n  - fieldPath: metadata/annotations/x\n"),
+        ("ConfigMapGenerator",
+         "apiVersion: builtin\nkind: ConfigMapGenerator\nmetadata:\n  name: cfg\n"
+         "files:\n  - {ref}\n"),
+        ("SecretGenerator",
+         "apiVersion: builtin\nkind: SecretGenerator\nmetadata:\n  name: secret\n"
+         "envs:\n  - {ref}\n"),
+    ])
+    def test_nested_plugin_snapshot_escapes_rejected(
+        self, tmp_path: Path, kind: str, config: str,
+    ) -> None:
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "generators:\n  - generators.yaml\n",
+            "manifests/overlays/prod/generators.yaml":
+                config.format(ref="../../../../etc/passwd"),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="escapes the repository snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    @pytest.mark.parametrize("kind,config", [
+        ("PatchTransformer", "apiVersion: builtin\nkind: PatchTransformer\npath: {ref}\n"),
+        ("ReplacementTransformer",
+         "apiVersion: builtin\nkind: ReplacementTransformer\nreplacements:\n"
+         "  - path: {ref}\n"),
+        ("ConfigMapGenerator",
+         "apiVersion: builtin\nkind: ConfigMapGenerator\nmetadata:\n  name: cfg\n"
+         "env: {ref}\n"),
+    ])
+    def test_nested_plugin_missing_and_hazard_references_rejected(
+        self, tmp_path: Path, kind: str, config: str,
+    ) -> None:
+        # A missing nested file is a broken historical input (render error,
+        # not "inputs absent"), and a hazard-backed reference can never be
+        # materialized.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "validators:\n  - validators.yaml\n",
+            "manifests/overlays/prod/validators.yaml":
+                config.format(ref="absent-input.yaml"),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+        repo = build_repo(tmp_path, name="repo-hazard", files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "validators:\n  - validators.yaml\n",
+            "manifests/overlays/prod/validators.yaml":
+                config.format(ref="patch.yaml"),
+        })
+        os.symlink("/etc/passwd", repo / "manifests/overlays/prod/patch.yaml")
+        records, _ = snap_candidate(repo, tmp_path, name="snap-hazard")
+        with pytest.raises(RenderError, match="cannot be safely materialized"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_inline_configuration_validated(self, tmp_path: Path) -> None:
+        # Inline entries (newlines in the kustomization itself) go through
+        # the same plugin validation as referenced configuration files.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "transformers:\n"
+                "  - |\n"
+                "    apiVersion: builtin\n"
+                "    kind: PatchTransformer\n"
+                "    path: https://example.invalid/patch.yaml\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_second_document_validated(self, tmp_path: Path) -> None:
+        # Every document in a multi-document configuration stream is
+        # checked, not just the first.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "transformers:\n  - transformers.yaml\n",
+            "manifests/overlays/prod/transformers.yaml": (
+                "apiVersion: builtin\nkind: PrefixTransformer\nmetadata:\n"
+                "  name: prefix\nprefix: pre-\n"
+                "---\n"
+                "apiVersion: builtin\nkind: PatchTransformer\n"
+                "path: https://example.invalid/patch.yaml\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_list_document_items_validated(self, tmp_path: Path) -> None:
+        # kustomize expands *List documents into their items before
+        # configuring plugins; a reference hidden behind a List is caught.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "generators:\n  - generators.yaml\n",
+            "manifests/overlays/prod/generators.yaml": (
+                "apiVersion: v1\nkind: List\nitems:\n"
+                "  - apiVersion: builtin\n    kind: PatchTransformer\n"
+                "    path: https://example.invalid/patch.yaml\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_glob_matches_validated(self, tmp_path: Path) -> None:
+        # Globbed plugin configuration files are resolved and each match's
+        # contents validated.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "transformers:\n  - 'transformers/*.yaml'\n",
+            "manifests/overlays/prod/transformers/ok.yaml":
+                "apiVersion: builtin\nkind: PrefixTransformer\nprefix: pre-\n",
+            "manifests/overlays/prod/transformers/bad.yaml":
+                "apiVersion: builtin\nkind: PatchTransformer\n"
+                "path: https://example.invalid/patch.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_helm_inflator_rejected(self, tmp_path: Path) -> None:
+        # HelmChartInflationGenerator inside a generators file is the same
+        # Helm-in-Kustomize vector as the helmCharts field.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "generators:\n  - generators.yaml\n",
+            "manifests/overlays/prod/generators.yaml": (
+                "apiVersion: builtin\nkind: HelmChartInflationGenerator\n"
+                "metadata:\n  name: chart\nchartHome: charts\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="Helm-in-Kustomize"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_external_and_unknown_kinds_rejected(self, tmp_path: Path) -> None:
+        # Non-builtin plugin configurations (exec/go/container/function
+        # plugins) and unrecognized builtin kinds fail actionably instead
+        # of bypassing validation.
+        for index, (content, expected) in enumerate((
+            ("apiVersion: cfg.kustomize.io/v1beta1\nkind: FancyTransformer\n", "only builtin"),
+            ("kind: PrefixTransformer\n", "only builtin"),
+            ("apiVersion: builtin\nkind: MysteryTransformer\n", "not supported"),
+            ("just a scalar\n", "must be YAML mappings"),
+        )):
+            repo = build_repo(tmp_path, name=f"repo-{index}", files={
+                "manifests/overlays/prod/kustomization.yaml":
+                    "transformers:\n  - transformers.yaml\n",
+                "manifests/overlays/prod/transformers.yaml": content,
+            })
+            records, _ = snap_candidate(repo, tmp_path, name=f"snap-{index}")
+            with pytest.raises(RenderError, match=expected):
+                renderers.render(
+                    records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+                )
+
+    def test_crds_and_configurations_inline_entries_rejected(self, tmp_path: Path) -> None:
+        # crds/configurations entries are file paths, not plugin
+        # configurations; inline entries fail actionably.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "configurations:\n  - |\n    some: inline\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="must be file paths"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_nested_plugin_references_resolve_against_invoking_kustomization(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The pinned loader resolves plugin-configuration references
+        # relative to the directory of the kustomization that declared the
+        # entry — not the configuration file's own directory. A shared
+        # configuration file in common/ may therefore only reference patch
+        # data that exists next to the invoking kustomization.
+        shared_config = (
+            "apiVersion: builtin\nkind: PatchTransformer\npath: patch.yaml\n"
+        )
+        repo = build_repo(tmp_path, files={
+            "manifests/common/patch-transformer.yaml": shared_config,
+            # patch.yaml exists in the invoking kustomization directory only.
+            "manifests/overlays/prod/patch.yaml":
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n",
+            "manifests/overlays/prod/kustomization.yaml":
+                "resources: []\ntransformers:\n  - ../../common/patch-transformer.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        output, runner = run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+        assert output == b""
+        assert len(runner.render_calls) == 2
+
+        # The same shared file without a matching patch next to the invoking
+        # kustomization is a broken reference even though patch.yaml exists
+        # next to the configuration file itself.
+        repo = build_repo(tmp_path, name="repo-negative", files={
+            "manifests/common/patch-transformer.yaml": shared_config,
+            "manifests/common/patch.yaml":
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n",
+            "manifests/overlays/prod/kustomization.yaml":
+                "resources: []\ntransformers:\n  - ../../common/patch-transformer.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path, name="snap-negative")
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_safe_nested_local_plugin_configurations_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Ordinary local configurations keep rendering: an inline reference
+        # free transformer, a referenced generator with local files/envs,
+        # and a patch transformer with a local patch file.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "resources:\n  - deployment.yaml\n"
+                "transformers:\n"
+                "  - |\n"
+                "    apiVersion: builtin\n"
+                "    kind: PrefixTransformer\n"
+                "    metadata:\n"
+                "      name: prefix\n"
+                "    prefix: pre-\n"
+                "  - patch-transformer.yaml\n"
+                "generators:\n  - generators.yaml\n"
+            ),
+            "manifests/overlays/prod/deployment.yaml":
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n",
+                "manifests/overlays/prod/patch.yaml":
+                    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n",
+                "manifests/overlays/prod/patch-transformer.yaml":
+                    "apiVersion: builtin\nkind: PatchTransformer\npath: patch.yaml\n",
+                "manifests/overlays/prod/generators.yaml": (
+                    "apiVersion: builtin\nkind: ConfigMapGenerator\n"
+                    "metadata:\n  name: generated\n"
+                    "files:\n  - data.ini\nenvs:\n  - config.env\nenv: extra.env\n"
+                ),
+                "manifests/overlays/prod/data.ini": "key=value\n",
+                "manifests/overlays/prod/config.env": "A=1\n",
+                "manifests/overlays/prod/extra.env": "B=2\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        output, runner = run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+        assert output == b""
+        assert len(runner.render_calls) == 2
 
     def test_repository_root_path_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, copies={"kustomize": "manifests"})

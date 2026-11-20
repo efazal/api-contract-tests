@@ -16,8 +16,13 @@ compatibility check:
 - ``render`` produces rendered bytes for one revision using fixed
   ``go run <module>@<version>`` commands outside any provider-controlled
   go.mod/go.work influence, strictly offline (a ``file://`` module proxy
-  rooted at the prepared cache), in clean
-  renderer homes, twice per revision to prove determinism.
+  rooted at the prepared cache), in clean renderer homes with allowlisted
+  subprocess environments and isolated working directories, twice per
+  revision to prove determinism. Kustomization references — including
+  those nested inside generator/transformer/validator plugin
+  configurations — are resolved against the repository snapshot and
+  rejected (remote, escaping, hazardous, or missing) before any
+  subprocess runs.
 
 All diagnostics are sanitized: rendered manifests, values, and Secret contents
 never appear in error messages, and renderer subprocess output is bounded,
@@ -123,6 +128,36 @@ _HELM_RELEASE_NAME_RE = re.compile(
 _KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 _REMOTE_REFERENCE_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 _GLOB_CHARS = re.compile(r"[*?\[]")
+
+# Plugin configurations in ``generators``/``transformers``/``validators``
+# entries. Only builtin plugin configurations are supported: the pinned
+# kustomize configures every document through the *invoking kustomization's*
+# loader (internal/target/kusttarget_configplugin.go), so a non-builtin
+# configuration is an external exec/go/container plugin, which the pinned
+# binary refuses anyway — rejecting it here fails earlier and actionably.
+_BUILTIN_PLUGIN_API_VERSION = "builtin"
+# Kinds whose configurations hold file references resolved through the
+# invoking kustomization's loader (verified against the pinned kustomize
+# internal/builtins: every h.Loader().Load call site). Field shapes:
+# "file" (one path string), "files" (list of path strings), "replacements"
+# (list of mappings with an optional "path"), "kv" (generator sources).
+_PLUGIN_REFERENCE_FIELDS: dict[str, dict[str, str]] = {
+    "ConfigMapGenerator": {"files": "kv", "envs": "kv", "env": "kv"},
+    "SecretGenerator": {"files": "kv", "envs": "kv", "env": "kv"},
+    "PatchTransformer": {"path": "file"},
+    "PatchJson6902Transformer": {"path": "file"},
+    "PatchStrategicMergeTransformer": {"paths": "files"},
+    "ReplacementTransformer": {"replacements": "replacements"},
+    "ValueAddTransformer": {"targetFilePath": "file"},
+}
+# The remaining builtin kinds of the pinned kustomize carry no file
+# references (internal/plugins/builtinhelpers plus the loader call sites).
+_REFERENCE_FREE_PLUGIN_KINDS = frozenset({
+    "AnnotationsTransformer", "HashTransformer", "IAMPolicyGenerator",
+    "ImageTagTransformer", "LabelTransformer", "NamespaceTransformer",
+    "PrefixSuffixTransformer", "PrefixTransformer", "SuffixTransformer",
+    "ReplicaCountTransformer",
+})
 
 _GO_VERSION_RE = re.compile(r"go(\d+)\.(\d+)(?:\.(\d+))?")
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
@@ -242,20 +277,38 @@ def _remove_renderer_home(home: Path) -> None:
     shutil.rmtree(home, ignore_errors=True)
 
 
+# Explicit child-environment allowlist. Renderer subprocesses inherit only
+# the process search path (locating the pinned go toolchain); online
+# preparation additionally inherits the system CA bundle locations, because
+# fetching modules over TLS must trust the host's store. Everything else —
+# ambient credentials, kubeconfig, proxy settings, Helm/Kustomize/Go
+# overrides — is dropped rather than filtered, so auditing what a renderer
+# subprocess can see is a read of this tuple. This is process-level hygiene
+# only: OS-enforced isolation (network namespaces, sandboxes) is out of
+# scope.
+_TOOL_ENV_ALLOWLIST = ("PATH",)
+_PREPARATION_ENV_ALLOWLIST = _TOOL_ENV_ALLOWLIST + ("SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
 def _tool_env(cache_dir: Path | None, home: Path, *, offline: bool) -> dict[str, str]:
     """Environment for go commands, isolated from provider and user influence.
 
-    go.work/go.mod influence is disabled (``GOWORK=off``, ``GOENV=off``), the
-    toolchain is pinned to the local install (``GOTOOLCHAIN=local``), and HOME,
-    XDG directories, and the module/build caches point into isolated
-    locations. Render commands additionally run strictly offline
-    (``GOSUMDB=off`` and a ``file://`` module proxy rooted at the prepared
-    cache's download directory, which can only serve what preparation fetched
-    and verified); preparation instead forces Go's checksum database.
+    Only the allowlisted variables are inherited from the caller (see
+    ``_TOOL_ENV_ALLOWLIST``); ambient credentials, proxies, and tool
+    overrides never reach a renderer subprocess. go.work/go.mod influence
+    is disabled (``GOWORK=off``, ``GOENV=off``), the toolchain is pinned to
+    the local install (``GOTOOLCHAIN=local``), and HOME, XDG directories,
+    and the module/build caches point into isolated locations. Render
+    commands additionally run strictly offline (``GOSUMDB=off`` and a
+    ``file://`` module proxy rooted at the prepared cache's download
+    directory, which can only serve what preparation fetched and verified);
+    preparation instead forces Go's checksum database and resolves modules
+    through Go's own defaults, not an ambient proxy configuration.
     """
     env = {
-        key: value for key, value in os.environ.items()
-        if not key.startswith(("HELM_", "KUSTOMIZE_"))
+        key: os.environ[key]
+        for key in (_PREPARATION_ENV_ALLOWLIST if not offline else _TOOL_ENV_ALLOWLIST)
+        if key in os.environ
     }
     env.update({
         "GOWORK": "off",
@@ -1050,10 +1103,11 @@ def _parse_go_version(output: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
 
 
-def _check_toolchain(renderers: set[str], env: Mapping[str, str]) -> str:
+def _check_toolchain(renderers: set[str], env: Mapping[str, str],
+                     cwd: Path | None = None) -> str:
     try:
         result = _run(
-            ["go", "version"], env=dict(env),
+            ["go", "version"], env=dict(env), cwd=cwd,
             timeout=GO_VERSION_TIMEOUT_SECONDS, stdout_limit=4096,
         )
     except (subprocess.TimeoutExpired, OSError) as error:
@@ -1139,14 +1193,14 @@ def prepare_tools(config: Mapping[str, Any], cache_dir: Path | None) -> dict[str
     home = _new_renderer_home()
     try:
         env = _tool_env(cache, home, offline=False)
-        go_version = _check_toolchain(set(needed), env)
+        go_version = _check_toolchain(set(needed), env, cwd=home)
         tools: list[dict[str, Any]] = []
         for renderer in needed:
             tool = PREPARED_TOOLS[renderer]
             argv = ["go", "run", tool["pin"], "version"]
             try:
                 result = _run(
-                    argv, env=env, timeout=PREPARE_TIMEOUT_SECONDS,
+                    argv, env=env, cwd=home, timeout=PREPARE_TIMEOUT_SECONDS,
                     stdout_limit=MAX_DIAGNOSTIC_BYTES,
                 )
             except subprocess.TimeoutExpired as error:
@@ -1182,7 +1236,7 @@ def prepare_tools(config: Mapping[str, Any], cache_dir: Path | None) -> dict[str
             argv = ["go", "run", tool["pin"], "version"]
             try:
                 result = _run(
-                    argv, env=_tool_env(cache, home, offline=True),
+                    argv, env=_tool_env(cache, home, offline=True), cwd=home,
                     timeout=PREPARE_TIMEOUT_SECONDS,
                     stdout_limit=MAX_DIAGNOSTIC_BYTES,
                 )
@@ -1245,7 +1299,7 @@ def _render_with_go(renderer: str, argv: list[str], scenario: Mapping[str, Any],
     home = _new_renderer_home()
     try:
         env = _tool_env(cache_dir, home, offline=True)
-        _check_toolchain({renderer}, env)
+        _check_toolchain({renderer}, env, cwd=home)
     finally:
         _remove_renderer_home(home)
     _verify_prepared_cache(cache_dir, renderer)
@@ -1256,8 +1310,11 @@ def _render_with_go(renderer: str, argv: list[str], scenario: Mapping[str, Any],
         try:
             env = _tool_env(cache_dir, home, offline=True)
             try:
+                # Rendering runs from the isolated renderer home, not the
+                # caller's working directory: nothing in the checkout that
+                # spawned this process can influence file resolution.
                 result = _run(
-                    list(argv), env=env, timeout=RENDER_TIMEOUT_SECONDS,
+                    list(argv), env=env, cwd=home, timeout=RENDER_TIMEOUT_SECONDS,
                     stdout_limit=MAX_RENDER_OUTPUT_BYTES + 1,
                 )
             except subprocess.TimeoutExpired as error:
@@ -1540,7 +1597,7 @@ def _resolve_local_reference(entry: str, base_dir: str, snapshot: _Snapshot, fie
 
 
 def _resolve_glob_files(entry: str, base_dir: str, snapshot: _Snapshot, field: str,
-                        where: str) -> None:
+                        where: str) -> list[str]:
     prefix = base_dir.strip("/") + "/"
     hits = sorted(
         file for file in snapshot.files
@@ -1562,26 +1619,168 @@ def _resolve_glob_files(entry: str, base_dir: str, snapshot: _Snapshot, field: s
         raise RenderError(
             f"{where}: {field} entry {entry!r} matches no files in the snapshot"
         )
+    return hits
 
 
-def _check_inline_plugin_spec(entry: str, where: str) -> None:
+def _plugin_spec_documents(content: str | bytes, source: str) -> list[dict[str, Any]]:
+    """Parse a plugin configuration stream the way the pinned kustomize does.
+
+    Every document in a ``generators``/``transformers``/``validators`` entry
+    is configured as a plugin, and any document whose kind ends in ``List``
+    is expanded into its items (resource/factory.go ``inlineAnyEmbeddedLists``).
+    Empty documents are ignored; anything else must be a mapping.
+    """
     try:
-        parsed = yaml.safe_load(entry)
-    except yaml.YAMLError as error:
+        text = content.decode("utf-8") if isinstance(content, bytes) else content
+        parsed = list(yaml.safe_load_all(text))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise RenderError(
-            f"{where}: inline specification is not valid YAML ({type(error).__name__})"
+            f"{source}: plugin configuration is not valid YAML ({type(error).__name__})"
         ) from error
-    specs = parsed if isinstance(parsed, list) else [parsed]
-    for spec in specs:
-        if not isinstance(spec, dict):
+    specs: list[dict[str, Any]] = []
+    for document in parsed:
+        if document is None:
             continue
-        combined = f"{spec.get('apiVersion', '')} {spec.get('kind', '')}"
+        if not isinstance(document, dict):
+            raise RenderError(f"{source}: plugin configurations must be YAML mappings")
+        kind = document.get("kind")
+        items = document.get("items")
+        if isinstance(kind, str) and kind.endswith("List") and isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    raise RenderError(f"{source}: list items must be YAML mappings")
+                specs.append(item)
+            continue
+        specs.append(document)
+    return specs
+
+
+def _validate_plugin_input(entry: str, field: str, source: str,
+                           kust_dir: str, snapshot: _Snapshot) -> None:
+    """Resolve one file reference from a plugin configuration, fail closed.
+
+    References inside plugin configurations resolve through the *invoking
+    kustomization's* loader — relative to ``kust_dir``, the directory of the
+    kustomization that declared the entry — not the configuration file's own
+    directory (pinned kustomize: kusttarget_configplugin.go hands every
+    plugin's Config call the kustomization's loader). Literal data is never
+    routed through here, so URL-like literal values stay legal.
+    """
+    if _GLOB_CHARS.search(entry):
+        _resolve_glob_files(entry, kust_dir, snapshot, field, source)
+    else:
+        _resolve_local_reference(
+            entry, kust_dir, snapshot, field, source, require_file=True
+        )
+
+
+def _validate_generator_sources(entry: Mapping[str, Any], label: str,
+                                kust_dir: str, snapshot: _Snapshot) -> None:
+    """Validate the files/envs/env reference fields of one generator entry.
+
+    Shared by kustomization-level ``configMapGenerator``/``secretGenerator``
+    entries and builtin generator plugin configurations. File sources accept
+    ``key=path`` aliases (generators.ParseFileSource splits on the single
+    ``=``); env sources reject ``=`` themselves; the deprecated singular
+    ``env`` (merged into ``envs`` by the pinned kustomize) holds one plain
+    file path.
+    """
+    for key in ("files", "envs"):
+        values = entry.get(key)
+        if values is None:
+            continue
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise RenderError(f"{label}: {key} entries must be strings")
+        for value in values:
+            if key == "files" and "=" in value:
+                path_value = value.split("=", 1)[1]
+            else:
+                path_value = value
+            _validate_plugin_input(path_value, key, label, kust_dir, snapshot)
+    env = entry.get("env")
+    if env is not None:
+        if not isinstance(env, str) or not env:
+            raise RenderError(f"{label}: env must be a nonempty string")
+        _validate_plugin_input(env, "env", label, kust_dir, snapshot)
+
+
+def _validate_plugin_spec(spec: Mapping[str, Any], source: str,
+                          kust_dir: str, snapshot: _Snapshot) -> None:
+    """Validate one builtin plugin configuration, rejecting unsafe forms."""
+    api_version = spec.get("apiVersion")
+    kind = spec.get("kind")
+    if isinstance(api_version, str) and isinstance(kind, str):
+        combined = f"{api_version} {kind}"
         for forbidden in ("exec", "container"):
             if re.search(rf"\b{forbidden}\b", combined, re.IGNORECASE):
                 raise RenderError(
-                    f"{where}: {forbidden} plugins are not supported; kustomize rendering "
+                    f"{source}: {forbidden} plugins are not supported; kustomize rendering "
                     "is restricted to local file references and built-in transformers"
                 )
+    if api_version != _BUILTIN_PLUGIN_API_VERSION or not isinstance(kind, str) or not kind:
+        raise RenderError(
+            f"{source}: only builtin plugin configurations (apiVersion "
+            f"{_BUILTIN_PLUGIN_API_VERSION!r}) are supported; external, exec, and "
+            "container plugin configurations are rejected before any subprocess runs"
+        )
+    if kind == "HelmChartInflationGenerator":
+        raise RenderError(
+            f"{source}: Helm-in-Kustomize (HelmChartInflationGenerator) is not supported; "
+            "render the chart with the helm renderer instead"
+        )
+    fields = _PLUGIN_REFERENCE_FIELDS.get(kind)
+    if fields is None:
+        if kind not in _REFERENCE_FREE_PLUGIN_KINDS:
+            raise RenderError(
+                f"{source}: builtin plugin kind {kind!r} is not supported; rendering "
+                "supports the builtin transformers and generators of the pinned kustomize"
+            )
+        return
+    if kind in ("ConfigMapGenerator", "SecretGenerator"):
+        _validate_generator_sources(spec, source, kust_dir, snapshot)
+        return
+    for field, shape in fields.items():
+        value = spec.get(field)
+        if value is None:
+            continue
+        if shape == "file":
+            if not isinstance(value, str) or not value:
+                raise RenderError(f"{source}: {field} must be a nonempty string")
+            _validate_plugin_input(value, field, source, kust_dir, snapshot)
+        elif shape == "files":
+            if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value
+            ):
+                raise RenderError(f"{source}: {field} must be a list of strings")
+            for item in value:
+                _validate_plugin_input(item, field, source, kust_dir, snapshot)
+        elif shape == "replacements":
+            if not isinstance(value, list):
+                raise RenderError(f"{source}: {field} must be a list")
+            for entry in value:
+                if not isinstance(entry, dict):
+                    raise RenderError(f"{source}: {field} entries must be mappings")
+                path = entry.get("path")
+                if path is None:
+                    continue
+                if not isinstance(path, str) or not path:
+                    raise RenderError(f"{source}: {field} path must be a nonempty string")
+                _validate_plugin_input(path, f"{field} path", source, kust_dir, snapshot)
+
+
+def _validate_plugin_config(content: str | bytes, source: str,
+                            kust_dir: str, snapshot: _Snapshot) -> None:
+    """Validate every plugin spec in one generators/transformers/validators entry.
+
+    ``content`` is either an inline entry from the kustomization itself or a
+    referenced configuration file's bytes; every document in the stream is
+    checked, not just the first. Unrecognized or non-builtin plugin forms
+    fail actionably instead of bypassing validation.
+    """
+    for spec in _plugin_spec_documents(content, source):
+        _validate_plugin_spec(spec, source, kust_dir, snapshot)
 
 
 def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
@@ -1624,7 +1823,11 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
             resolved = _resolve_local_reference(entry, kust_dir, snapshot, field, where)
             if resolved in snapshot.directories:
                 _validate_kustomization_tree(snapshot, resolved, visited)
-    for field in ("crds", "configurations", "generators", "transformers", "validators"):
+    # crds and configurations hold data files kustomize consumes itself
+    # (CRD manifests, FieldSpec configuration); they are not plugin
+    # configurations and carry no nested reference fields, so entries are
+    # plain file paths or globs.
+    for field in ("crds", "configurations"):
         entries = document.get(field)
         if entries is None:
             continue
@@ -1634,15 +1837,42 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
             if not isinstance(entry, str):
                 raise RenderError(f"{where}: {field} entries must be strings")
             if "\n" in entry:
-                _check_inline_plugin_spec(entry, where)
-            elif entry.startswith("builtin:"):
-                continue
-            elif _GLOB_CHARS.search(entry):
+                raise RenderError(f"{where}: {field} entries must be file paths")
+            if _GLOB_CHARS.search(entry):
                 _resolve_glob_files(entry, kust_dir, snapshot, field, where)
             else:
                 _resolve_local_reference(
                     entry, kust_dir, snapshot, field, where, require_file=True
                 )
+    # generators, transformers, and validators hold plugin configurations:
+    # inline entries, referenced configuration files, or globs of them. The
+    # pinned kustomize configures every document in each entry as a plugin
+    # through the invoking kustomization's loader, so both the entry paths
+    # and the references nested inside the configurations are validated —
+    # the configuration file's own location is never the resolution base.
+    for field in ("generators", "transformers", "validators"):
+        entries = document.get(field)
+        if entries is None:
+            continue
+        if not isinstance(entries, list):
+            raise RenderError(f"{where}: {field} must be a list")
+        for entry in entries:
+            if not isinstance(entry, str):
+                raise RenderError(f"{where}: {field} entries must be strings")
+            if "\n" in entry:
+                _validate_plugin_config(entry, where, kust_dir, snapshot)
+            elif entry.startswith("builtin:"):
+                continue
+            elif _GLOB_CHARS.search(entry):
+                for rel in _resolve_glob_files(entry, kust_dir, snapshot, field, where):
+                    _validate_plugin_config(
+                        snapshot.read(rel), rel, kust_dir, snapshot
+                    )
+            else:
+                rel = _resolve_local_reference(
+                    entry, kust_dir, snapshot, field, where, require_file=True
+                )
+                _validate_plugin_config(snapshot.read(rel), rel, kust_dir, snapshot)
 
     patches = document.get("patches")
     if patches is not None:
@@ -1708,28 +1938,7 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
         for entry in entries:
             if not isinstance(entry, dict):
                 raise RenderError(f"{where}: {field} entries must be mappings")
-            for key in ("files", "envs"):
-                values = entry.get(key)
-                if values is None:
-                    continue
-                if not isinstance(values, list) or not all(
-                    isinstance(value, str) for value in values
-                ):
-                    raise RenderError(f"{where}: {field} {key} entries must be strings")
-                for value in values:
-                    # kustomize's file sources accept "key=path" aliases
-                    # (parseFileSource splits on the single "="); env sources
-                    # reject "=" themselves, so only files are split here.
-                    if key == "files" and "=" in value:
-                        path_value = value.split("=", 1)[1]
-                    else:
-                        path_value = value
-                    if _GLOB_CHARS.search(path_value):
-                        _resolve_glob_files(path_value, kust_dir, snapshot, key, where)
-                    else:
-                        _resolve_local_reference(
-                            path_value, kust_dir, snapshot, key, where, require_file=True
-                        )
+            _validate_generator_sources(entry, f"{where}: {field}", kust_dir, snapshot)
 
 
 def _render_kustomize(snapshot: _Snapshot, scenario: Mapping[str, Any],

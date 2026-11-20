@@ -92,10 +92,16 @@ jobs:
       - name: Prepare renderer tool cache
         run: python3 cmd/contract-tests/cli.py manifest-prepare --repo . --manifest-set selftest/manifests.yaml --tool-cache-dir "${RUNNER_TEMP}/manifest-tool-cache"
 
-      # Rendering inside manifest-check is offline by construction (the checker
-      # disables the module proxy for every render subprocess), so this group
-      # reuses only the cache prepared above. A missing or unprepared cache
-      # fails the tests instead of skipping them.
+      # Rendering inside manifest-check is offline by process-level controls,
+      # not by OS enforcement: every render subprocess runs with an
+      # allowlisted environment, its module proxy pointed at the prepared
+      # cache (which can only serve what preparation fetched and verified),
+      # its working directory isolated, and every kustomization reference —
+      # including nested plugin configurations — validated against the
+      # repository snapshot before any subprocess starts. No network
+      # namespace or sandbox is used, so this group reuses only the cache
+      # prepared above; a missing or unprepared cache fails the tests
+      # instead of skipping them.
       - name: Run real-renderer integration tests
         env:
           MANIFEST_RENDERERS_CACHE: ${{ runner.temp }}/manifest-tool-cache

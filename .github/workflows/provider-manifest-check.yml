@@ -72,8 +72,12 @@ jobs:
           TOOL_CACHE_DIR: ${{ runner.temp }}/manifest-tool-cache
         run: python3 .contract-tests/cmd/workflow-steps/steps.py prepare manifest
 
-      # Strictly offline: the checker disables the module proxy itself and only
-      # reuses the cache prepared above; it never downloads tools or provider content.
+      # Offline by process-level controls, not OS enforcement: the checker
+      # runs every render subprocess with an allowlisted environment, the
+      # module proxy pointed at the prepared cache only, an isolated working
+      # directory, and manifest references validated before any subprocess
+      # runs, so it never downloads tools or provider content. No network
+      # namespace or sandbox is involved.
       - name: Run manifest compatibility check
         env:
           MANIFEST_SET: ${{ inputs.manifest-set }}

@@ -20,6 +20,7 @@ workflow self-test (``.github/workflows/self-test.yml``) renders in CI.
 """
 
 import copy
+import http.server
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +227,19 @@ def raw_scenario(scenario_id: str, sources: list[str],
     return scenario
 
 
+def kustomize_scenario(scenario_id: str, path: str,
+                       version: str = "1.35.10", **extra: Any) -> dict[str, Any]:
+    scenario: dict[str, Any] = {
+        "id": scenario_id,
+        "renderer": "kustomize",
+        "namespace": "selftest",
+        "kubernetesVersion": version,
+        "path": path,
+    }
+    scenario.update(extra)
+    return scenario
+
+
 def scenario_baseline_findings(report: dict[str, Any], scenario_id: str,
                                index: int = 0) -> list[dict[str, Any]]:
     return [finding for finding in report["baselines"][index]["findings"]
@@ -326,6 +341,175 @@ class TestPreparationAndOfflineRendering:
         ok_result, ok_report = repo.check([base], outputs.parent / "ok", cache=tool_cache)
         assert ok_result.returncode == 0
         assert ok_report["status"] == "compatible"
+
+
+# ---------------------------------------------------------------------------
+# Nested plugin configurations: real renders and no-network proof
+# ---------------------------------------------------------------------------
+
+class TestNestedPluginConfigurations:
+    def test_real_kustomize_renders_valid_nested_local_configs(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """Local nested plugin configurations render with the pinned kustomize.
+
+        Covers an inline transformer, a referenced PatchTransformer whose
+        patch path resolves against the invoking kustomization directory, a
+        builtin generator with files/envs and the deprecated singular env,
+        and a ValueAddTransformer target file.
+        """
+        repo.write("manifests/overlays/prod/kustomization.yaml", """\
+resources:
+  - deployment.yaml
+transformers:
+  - |
+    apiVersion: builtin
+    kind: PrefixTransformer
+    metadata:
+      name: prefix
+    prefix: pre-
+    fieldSpecs:
+      - path: metadata/name
+  - patch-transformer.yaml
+  - value-add.yaml
+generators:
+  - generators.yaml
+""")
+        repo.write("manifests/overlays/prod/deployment.yaml", """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: example.com/web:1.0
+""")
+        repo.write("manifests/overlays/prod/patch.yaml", """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+""")
+        repo.write("manifests/overlays/prod/patch-transformer.yaml",
+                   "apiVersion: builtin\nkind: PatchTransformer\n"
+                   "metadata:\n  name: patch\npath: patch.yaml\n")
+        repo.write("manifests/overlays/prod/value-add.yaml", """\
+apiVersion: builtin
+kind: ValueAddTransformer
+metadata:
+  name: value-add
+targetFilePath: value-add-targets.yaml
+targets:
+  - selector:
+      kind: Deployment
+    fieldPath: metadata/annotations/example.com~1added
+""")
+        repo.write("manifests/overlays/prod/value-add-targets.yaml", """\
+targets:
+  - selector:
+      kind: Deployment
+    fieldPath: metadata/annotations/example.com~1shared
+""")
+        repo.write("manifests/overlays/prod/generators.yaml", """\
+apiVersion: builtin
+kind: ConfigMapGenerator
+metadata:
+  name: generated
+files:
+  - data.ini
+envs:
+  - config.env
+env: extra.env
+""")
+        repo.write("manifests/overlays/prod/data.ini", "key=value\n")
+        repo.write("manifests/overlays/prod/config.env", "A=1\n")
+        repo.write("manifests/overlays/prod/extra.env", "B=2\n")
+        repo.descriptor([kustomize_scenario("nested", "manifests/overlays/prod")])
+        base = repo.commit("baseline")
+        result, report = repo.check([base], outputs, cache=tool_cache)
+        assert result.returncode == 0, joined_errors(report)
+        assert report["status"] == "compatible", joined_errors(report)
+        # Both the baseline and the candidate rendered the nested local
+        # plugin configurations with the pinned kustomize: the prefixed
+        # Deployment, the patched replica count, and the generated
+        # ConfigMap (files, envs, and deprecated singular env) produce two
+        # objects on each side with no findings.
+        candidate_entry = report["candidate"]["scenarios"]["nested"]
+        assert candidate_entry["status"] == "ready", candidate_entry["errors"]
+        assert candidate_entry["object_count"] == 2
+        assert candidate_entry["render_digest"] is not None
+        baseline_entry = report["baselines"][0]["scenarios"]["nested"]
+        assert baseline_entry["status"] == "compared", baseline_entry.get("errors")
+        assert baseline_entry["object_count"] == 2
+        assert report["candidate_findings"] == []
+
+    def test_malicious_nested_reference_makes_no_http_request(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """A remote reference nested in a plugin configuration is rejected
+        before any subprocess runs, proven with a bounded local listener
+        that would record any request the render tried to make."""
+        hits: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # pragma: no cover - must not happen
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"apiVersion: v1\nkind: ConfigMap\n")
+
+            def do_POST(self) -> None:  # pragma: no cover - must not happen
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True,
+        )
+        thread.start()
+        try:
+            # The baseline is a valid local kustomization; the candidate
+            # adds the remote nested reference, so the failure isolates the
+            # malicious change.
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "resources:\n  - deployment.yaml\n")
+            repo.write("manifests/overlays/prod/deployment.yaml",
+                       "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n")
+            repo.descriptor([kustomize_scenario("nested", "manifests/overlays/prod")])
+            base = repo.commit("valid baseline")
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "transformers:\n  - transformers.yaml\n")
+            repo.write(
+                "manifests/overlays/prod/transformers.yaml",
+                "apiVersion: builtin\nkind: PatchTransformer\n"
+                f"path: http://127.0.0.1:{port}/patch.yaml\n",
+            )
+            repo.commit("malicious nested reference")
+            result, report = repo.check([base], outputs, cache=tool_cache)
+            assert result.returncode == 2
+            assert report["status"] == "error"
+            assert "remote reference" in joined_errors(report)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        assert hits == [], "the renderer must not issue any network request"
 
 
 # ---------------------------------------------------------------------------
