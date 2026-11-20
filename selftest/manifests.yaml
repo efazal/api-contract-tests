@@ -3,12 +3,19 @@
 # generated ConfigMap reference) against the three audited Kubernetes minors.
 #
 # The baselineCases below are the explicit-new bootstrap declarations required
-# when these fixtures were introduced. Both refs were verified (2026-11-06) to
-# contain no selftest/manifests/ tree and no selftest/manifests.yaml:
+# when these fixtures were introduced. The refs were verified to contain no
+# selftest/manifests/ tree and no selftest/manifests.yaml:
 #   fab2dfff0566e367e6c0dcf58b475742dfe8649a  main head / pull-request base
+#                                              at fixture introduction
+#                                              (verified 2026-11-06)
 #   8eb288050bb4fb67324935e4bdf6c5c864af7008  task-009 commit, the intended
 #                                              previous-push ref when the
 #                                              fixture commit lands on main
+#                                              (verified 2026-11-06)
+#   d63fe27957117fd99161a693c7fdef9e20efb9d9  main head at PR #20, the
+#                                              pull-request base the manifest
+#                                              self-test runs against
+#                                              (verified 2026-11-20)
 # A later event baseline that still lacks the fixtures but has no declaration
 # fails actionably; update this file only after verifying absence. Baselines
 # that contain the fixtures compare normally without any declaration.
@@ -34,6 +41,9 @@ spec:
         - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
           state: new
           reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
+        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
+          state: new
+          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"
     - id: helm-app
       renderer: helm
       namespace: default
@@ -52,6 +62,9 @@ spec:
         - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
           state: new
           reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
+        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
+          state: new
+          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"
     - id: kustomize-app
       renderer: kustomize
       namespace: selftest
@@ -64,3 +77,6 @@ spec:
         - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
           state: new
           reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
+        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
+          state: new
+          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"
