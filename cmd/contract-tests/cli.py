@@ -158,6 +158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest_check.add_argument("--scenario-id", help="Run a single scenario by id; default runs every scenario")
     manifest_check.add_argument("--baseline-ref", action="append", required=True,
                                 help="Full resolved Git SHA; repeat for every supported baseline. Mutable refs are rejected.")
+    manifest_check.add_argument("--allow-missing-baseline", action="append", default=[],
+                                help="Full Git SHA of a requested baseline whose wholly absent scenario inputs may "
+                                     "be classified as new; repeatable. Must be a subset of --baseline-ref; partial "
+                                     "absence still fails.")
     manifest_check.add_argument("--output-dir", type=Path, required=True,
                                 help="New report directory; existing paths are never overwritten")
     manifest_check.add_argument("--tool-cache-dir", type=Path,

@@ -1441,6 +1441,20 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
         scenario.get("path"), f"scenario {scenario_id!r} chart path"
     )
     chart_prefix = chart_rel.strip("/") + "/"
+    # Classify the exact chart root before its descendants: a root that is
+    # itself a gitlink, symlink, or LFS pointer is a hazard, and a root that
+    # is a regular file is a wrong-kind input — neither is an absent chart.
+    root_hazard = snapshot.hazards.get(chart_rel)
+    if root_hazard is not None:
+        raise RenderError(
+            f"scenario {scenario_id!r}: chart path {chart_rel!r} cannot be safely "
+            f"materialized ({root_hazard.get('hazard')})"
+        )
+    if chart_rel in snapshot.files:
+        raise RenderError(
+            f"scenario {scenario_id!r}: chart path {chart_rel!r} is a regular file, "
+            "not a chart directory"
+        )
     chart_hazards = sorted(file for file in snapshot.hazards if file.startswith(chart_prefix))
     if chart_hazards:
         hazard = snapshot.hazards[chart_hazards[0]]
@@ -1449,10 +1463,34 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
             f"{chart_hazards[0]!r} that cannot be safely materialized "
             f"({hazard.get('hazard')})"
         )
+    # Classify every selected values file before declaring the chart absent:
+    # a hazardous one is malformed regardless of the chart, and a present one
+    # makes the input set partial rather than wholly missing.
+    values_present: list[str] = []
+    values_missing: list[str] = []
+    for entry in scenario.get("valuesFiles") or []:
+        rel = _validate_repo_relative(entry, f"scenario {scenario_id!r} values file")
+        if rel in snapshot.hazards:
+            raise RenderError(
+                f"scenario {scenario_id!r}: values file {rel!r} cannot be safely materialized "
+                f"({snapshot.hazards[rel].get('hazard')})"
+            )
+        if rel in snapshot.files:
+            values_present.append(rel)
+        else:
+            values_missing.append(rel)
     if not any(file.startswith(chart_prefix) for file in snapshot.files):
+        if values_present:
+            raise MissingInputError(
+                f"scenario {scenario_id!r}: chart path {chart_rel!r} is absent from the "
+                f"snapshot but selected values files are present "
+                f"({', '.join(values_present)})",
+                missing=[chart_rel],
+                matched=values_present,
+            )
         raise MissingInputError(
             f"scenario {scenario_id!r}: chart path {chart_rel!r} is absent from the snapshot",
-            missing=[chart_rel],
+            missing=[chart_rel, *values_missing],
             matched=[],
         )
     if f"{chart_rel}/Chart.yaml" not in snapshot.files:
@@ -1478,21 +1516,14 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
     if not isinstance(kubernetes_version, str) or not kubernetes_version:
         raise RenderError(f"scenario {scenario_id!r}: scenario requires kubernetesVersion")
 
-    values_rels: list[str] = []
-    for entry in scenario.get("valuesFiles") or []:
-        rel = _validate_repo_relative(entry, f"scenario {scenario_id!r} values file")
-        if rel in snapshot.hazards:
-            raise RenderError(
-                f"scenario {scenario_id!r}: values file {rel!r} cannot be safely materialized "
-                f"({snapshot.hazards[rel].get('hazard')})"
-            )
-        if rel not in snapshot.files:
-            raise MissingInputError(
-                f"scenario {scenario_id!r}: values file {rel!r} is absent from the snapshot",
-                missing=[rel],
-                matched=[chart_rel],
-            )
-        values_rels.append(rel)
+    if values_missing:
+        raise MissingInputError(
+            f"scenario {scenario_id!r}: values file(s) "
+            f"{', '.join(repr(rel) for rel in values_missing)} are absent from the snapshot",
+            missing=values_missing,
+            matched=[chart_rel],
+        )
+    values_rels = values_present
     set_values = scenario.get("setValues") or {}
     if not isinstance(set_values, dict) or not all(
         isinstance(key, str) and isinstance(value, str) for key, value in set_values.items()
@@ -1948,6 +1979,20 @@ def _render_kustomize(snapshot: _Snapshot, scenario: Mapping[str, Any],
         scenario.get("path"), f"scenario {scenario_id!r} kustomize path"
     )
     kust_prefix = kust_rel.strip("/") + "/"
+    # Classify the exact overlay root before its descendants: a root that is
+    # itself a gitlink, symlink, or LFS pointer is a hazard, and a root that
+    # is a regular file is a wrong-kind input — neither is an absent overlay.
+    root_hazard = snapshot.hazards.get(kust_rel)
+    if root_hazard is not None:
+        raise RenderError(
+            f"scenario {scenario_id!r}: kustomize path {kust_rel!r} cannot be safely "
+            f"materialized ({root_hazard.get('hazard')})"
+        )
+    if kust_rel in snapshot.files:
+        raise RenderError(
+            f"scenario {scenario_id!r}: kustomize path {kust_rel!r} is a regular file, "
+            "not a kustomization directory"
+        )
     for name in _KUSTOMIZATION_NAMES:
         rel = f"{kust_rel}/{name}"
         if rel in snapshot.hazards:

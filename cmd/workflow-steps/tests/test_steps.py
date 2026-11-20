@@ -321,6 +321,28 @@ def test_manifest_raw_scenarios_omit_the_tool_cache():
     assert "--tool-cache-dir" not in steps.check_args("manifest", env, WORKSPACE)
 
 
+def test_manifest_allow_missing_baselines_propagate_as_exact_subset():
+    env = {"MODE": "enforce", "BASELINE_REFS": f"{SHA} {OTHER}",
+           "ALLOW_MISSING_BASELINE_REFS": f"{SHA} {OTHER} {SHA}"}
+    args = steps.check_args("manifest", env, WORKSPACE)
+    assert args.count("--allow-missing-baseline") == 3
+    authorized = [args[i + 1] for i, flag in enumerate(args) if flag == "--allow-missing-baseline"]
+    assert authorized == [SHA, OTHER, SHA]
+
+
+def test_manifest_allow_missing_baselines_must_be_a_subset():
+    env = {"MODE": "enforce", "BASELINE_REFS": SHA,
+           "ALLOW_MISSING_BASELINE_REFS": f"{SHA} deadbeef"}
+    with pytest.raises(steps.InputError, match="subset of baseline-refs"):
+        steps.check_args("manifest", env, WORKSPACE)
+
+
+def test_manifest_allow_missing_baselines_default_to_nothing():
+    # No input means no authorization: the strict fail-closed default.
+    env = {"MODE": "enforce", "BASELINE_REFS": SHA}
+    assert "--allow-missing-baseline" not in steps.check_args("manifest", env, WORKSPACE)
+
+
 def test_manifest_requires_at_least_one_baseline():
     with pytest.raises(steps.InputError, match="baseline-refs is required"):
         steps.check_args("manifest", {"MODE": "report", "BASELINE_REFS": " "}, WORKSPACE)

@@ -183,12 +183,15 @@ class ProviderRepo:
 
     def check(self, baselines: list[str], output: Path, *, mode: str = "enforce",
               scenario_id: str | None = None, cache: Path | None = None,
+              allow_missing: list[str] | None = None,
               manifest_set: str = ".rhoai/manifests.yaml",
               env: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
         argv = [sys.executable, str(CLI), "manifest-check",
                 "--repo", str(self.root), "--manifest-set", manifest_set]
         for baseline in baselines:
             argv += ["--baseline-ref", baseline]
+        for authorized in allow_missing or []:
+            argv += ["--allow-missing-baseline", authorized]
         if scenario_id is not None:
             argv += ["--scenario-id", scenario_id]
         argv += ["--output-dir", str(output)]
@@ -675,7 +678,7 @@ class TestRealRendererComparisons:
         repo.move_tree("selftest/manifests/kustomize", "config/kustomize")
         scenarios = repo.scenarios("kustomize-app")
         scenarios[0]["path"] = "config/kustomize/overlay"
-        scenarios[0]["baselineCases"].append({
+        scenarios[0].setdefault("baselineCases", []).append({
             "ref": base, "state": "existing",
             "inputs": {"path": "selftest/manifests/kustomize/overlay"},
         })
@@ -796,7 +799,7 @@ class TestRealRendererComparisons:
 
 
 # ---------------------------------------------------------------------------
-# Explicit-new bootstrap declarations (PR base and previous-push events)
+# Absent event baselines: explicit-new declarations and the bounded opt-in
 # ---------------------------------------------------------------------------
 
 class TestBootstrapDeclarations:
@@ -807,7 +810,7 @@ class TestBootstrapDeclarations:
         pre = repo.commit("history before the fixtures")
         repo.copy_fixtures("raw")
         scenarios = repo.scenarios("raw-app")
-        scenarios[0]["baselineCases"].append({
+        scenarios[0].setdefault("baselineCases", []).append({
             "ref": pre, "state": "new",
             "reason": "verified absence: the fixtures were introduced later",
         })
@@ -824,8 +827,6 @@ class TestBootstrapDeclarations:
         assert entry["status"] == "new"
         assert "verified absence" in entry["reason"]
         assert baseline["findings"] == []
-        # The shipped descriptor's real historical declarations (fab2dfff and
-        # 8eb2880) were never requested: unused provenance, not an error.
         assert report["errors"] == []
         assert "stale" not in joined_errors(report)
 
@@ -869,7 +870,7 @@ class TestBootstrapDeclarations:
         repo.edit("selftest/manifests/raw/deployment.yaml",
                   "image: example.com/web:1.0", "image: example.com/web:1.1")
         scenarios = repo.scenarios("raw-app")
-        scenarios[0]["baselineCases"].append({
+        scenarios[0].setdefault("baselineCases", []).append({
             "ref": introduction, "state": "new",
             "reason": "falsely claims the inputs are absent",
         })
@@ -891,7 +892,7 @@ class TestBootstrapDeclarations:
         pre = repo.commit("chart without the values file")
         repo.copy_fixtures("helm")  # candidate has the complete source set
         scenarios = repo.scenarios("helm-app")
-        scenarios[0]["baselineCases"].append({
+        scenarios[0].setdefault("baselineCases", []).append({
             "ref": pre, "state": "new",
             "reason": "falsely claims a fully absent source set",
         })
@@ -917,7 +918,7 @@ class TestBootstrapDeclarations:
         repo.copy_fixtures("raw", "kustomize")
         scenarios = repo.scenarios("raw-app", "kustomize-app")
         for scenario in scenarios:
-            scenario["baselineCases"].append({
+            scenario.setdefault("baselineCases", []).append({
                 "ref": pre, "state": "new",
                 "reason": "verified absence: the fixtures were introduced later",
             })
@@ -936,3 +937,100 @@ class TestBootstrapDeclarations:
         assert baseline["findings"] == []
         assert report["errors"] == []
         assert "stale" not in joined_errors(report)
+
+
+class TestAbsentEventBaselineOptIn:
+    def test_authorized_absent_event_baseline_is_new(
+        self, repo: ProviderRepo, outputs: Path
+    ) -> None:
+        """The fixture-introduction event: the PR base lacks the sources.
+
+        The event SHA itself is authorized, so the wholly absent inputs are
+        classified new with a traceable opt-in reason and no descriptor
+        declaration.
+        """
+        pre = repo.commit("history before the fixtures")
+        repo.copy_fixtures("raw")
+        repo.descriptor(repo.scenarios("raw-app"))
+        repo.commit("introduce fixtures")
+
+        result, report = repo.check(
+            [pre], outputs, mode="enforce", allow_missing=[pre],
+        )
+        assert result.returncode == 0
+        assert report["status"] == "new"
+        baseline = report["baselines"][0]
+        assert baseline["status"] == "new"
+        assert baseline["compatible"] is None
+        entry = baseline["scenarios"]["raw-app"]
+        assert entry["status"] == "new"
+        assert entry["reason"] == (
+            f"authorized absent baseline {pre}: every selected input is "
+            "absent (--allow-missing-baseline)"
+        )
+
+    def test_changed_event_sha_predating_fixtures_needs_no_descriptor_edit(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """The first post-merge push: a different event SHA, same absence.
+
+        The descriptor carries no per-ref declarations to keep current; the
+        authorization follows the event ref, so every renderer's scenario is
+        new without editing anything.
+        """
+        repo.commit("first push before the fixtures")
+        second = repo.commit("second push, still no fixtures")
+        repo.copy_fixtures("raw", "helm")
+        repo.descriptor(repo.scenarios("raw-app", "helm-app"))
+        repo.commit("introduce fixtures")
+
+        result, report = repo.check(
+            [second], outputs, cache=tool_cache, mode="enforce",
+            allow_missing=[second],
+        )
+        assert result.returncode == 0
+        assert report["status"] == "new"
+        for scenario_id in ("raw-app", "helm-app"):
+            entry = report["baselines"][0]["scenarios"][scenario_id]
+            assert entry["status"] == "new"
+
+    def test_opt_in_with_partial_helm_inputs_fails(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """Chart present, selected values absent: partial, not authorizable."""
+        repo.copy_fixtures("helm/app")  # chart only: the selected values file is absent
+        pre = repo.commit("chart without the values file")
+        repo.copy_fixtures("helm")  # candidate has the complete source set
+        repo.descriptor(repo.scenarios("helm-app"))
+        repo.commit("complete the source set")
+
+        result, report = repo.check(
+            [pre], outputs, cache=tool_cache, allow_missing=[pre],
+        )
+        assert result.returncode == 2
+        assert report["status"] == "error"
+        errors = joined_errors(report)
+        assert "authorized for absent inputs" in errors
+        assert "partially missing" in errors
+
+    def test_authorized_baseline_containing_fixtures_compares_normally(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """Authorization never forces present inputs new: they compare."""
+        repo.copy_fixtures("raw")
+        repo.descriptor(repo.scenarios("raw-app"))
+        present = repo.commit("baseline with the fixtures")
+        repo.edit("selftest/manifests/raw/deployment.yaml",
+                  "image: example.com/web:1.0", "image: example.com/web:1.1")
+        repo.commit("rollout")
+
+        result, report = repo.check(
+            [present], outputs, cache=tool_cache, mode="enforce",
+            allow_missing=[present],
+        )
+        assert result.returncode == 0
+        assert report["status"] == "compatible"
+        baseline = report["baselines"][0]
+        assert baseline["status"] == "compared"
+        assert baseline["compatible"] is True
+

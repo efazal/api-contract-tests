@@ -10,6 +10,9 @@ Design invariants (standing policy):
 
 - Candidate configuration drives scenario definitions on both sides; baseline
   revisions are exact Git blobs and need no historical descriptor.
+- Absent historical inputs fail closed unless the exact baseline SHA was
+  explicitly authorized with ``--allow-missing-baseline`` (and every selected
+  input is wholly absent); explicit ``baselineCases`` keep precedence.
 - Every requested baseline stays in the report whatever else failed; missing
   provenance is ``null``, never fabricated.
 - Suppression never deletes evidence: matched findings keep their severity and
@@ -267,6 +270,26 @@ def _case_for(scenario: Mapping[str, Any], ref: str) -> dict[str, Any] | None:
         if isinstance(case, Mapping) and case.get("ref") == ref:
             return dict(case)
     return None
+
+
+def _allow_missing_baselines(args: argparse.Namespace,
+                             baseline_refs: Sequence[str]) -> frozenset[str]:
+    """Validate the absent-input authorization as a subset of requested baselines.
+
+    Authorization is opt-in per exact requested SHA: an unrequested, mutable,
+    or malformed ref fails configuration instead of silently enabling absence
+    classification for a baseline nobody asked about. Callers that pass no
+    authorization keep the strict fail-closed default.
+    """
+    requested = set(baseline_refs)
+    allowed = frozenset(getattr(args, "allow_missing_baseline", None) or [])
+    unrequested = sorted(allowed - requested)
+    if unrequested:
+        raise CheckError(
+            "--allow-missing-baseline refs must be requested as --baseline-ref values; "
+            f"not requested: {', '.join(unrequested)}"
+        )
+    return allowed
 
 
 def _patch_extrapolation_finding(scenario: Mapping[str, Any],
@@ -651,6 +674,7 @@ def run_check(args: argparse.Namespace) -> int:
 
         config_data = config_module.load_config(args.repo, args.manifest_set, args.scenario_id)
         config_module.validate_context(config_data, args.repo, baseline_refs, catalogue)
+        allow_missing = _allow_missing_baselines(args, baseline_refs)
         scenarios: list[dict[str, Any]] = list(config_data["scenarios"])
         report["tools"] = dict(config_data.get("tools") or {})
 
@@ -753,6 +777,7 @@ def run_check(args: argparse.Namespace) -> int:
                     try:
                         content = modules["renderers"].render(baseline_records, effective, cache_dir)
                     except modules["renderers"].MissingInputError as error:
+                        override = case is not None and case.get("state") == "existing"
                         if case is not None and case.get("state") == "new":
                             if error.matched:
                                 entry["status"] = "error"
@@ -764,12 +789,36 @@ def run_check(args: argparse.Namespace) -> int:
                             else:
                                 entry["status"] = "new"
                                 entry["reason"] = str(case.get("reason"))
+                        elif ref in allow_missing and not error.matched and not override:
+                            # Authorized absence: the SHA was explicitly opted
+                            # in and every selected input is wholly absent.
+                            entry["status"] = "new"
+                            entry["reason"] = (
+                                f"authorized absent baseline {ref}: every selected input is "
+                                "absent (--allow-missing-baseline)"
+                            )
                         else:
                             entry["status"] = "error"
-                            entry["errors"].append(
-                                f"scenario {scenario_id!r} inputs are absent at baseline {ref}; declare "
-                                "an explicit new baselineCase only after verifying absence"
-                            )
+                            if override:
+                                entry["errors"].append(
+                                    f"scenario {scenario_id!r} inputs declared by the existing "
+                                    f"baselineCase override are absent at baseline {ref}; a broken "
+                                    "override cannot be bypassed by absent-input authorization"
+                                )
+                            elif ref in allow_missing:
+                                entry["errors"].append(
+                                    f"baseline {ref} is authorized for absent inputs but scenario "
+                                    f"{scenario_id!r} has present inputs "
+                                    f"({', '.join(sorted(error.matched))}); a partially missing "
+                                    "source set cannot be authorized as new"
+                                )
+                            else:
+                                entry["errors"].append(
+                                    f"scenario {scenario_id!r} inputs are absent at baseline {ref}; "
+                                    "declare an explicit new baselineCase only after verifying "
+                                    "absence, or authorize the exact SHA with "
+                                    "--allow-missing-baseline"
+                                )
                         continue
                     except Exception as error:
                         entry["status"] = "error"

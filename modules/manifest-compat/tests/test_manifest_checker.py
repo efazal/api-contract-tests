@@ -250,12 +250,14 @@ class Repo:
         return self.git("rev-parse", "HEAD")
 
     def check(self, baselines: list[str], output: Path, *, mode: str = "enforce",
-              scenario_id: str | None = None,
+              scenario_id: str | None = None, allow_missing: list[str] | None = None,
               manifest_set: str = ".rhoai/manifests.yaml") -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
         argv = [sys.executable, str(CLI), "manifest-check",
                 "--repo", str(self.root), "--manifest-set", manifest_set]
         for baseline in baselines:
             argv += ["--baseline-ref", baseline]
+        for authorized in allow_missing or []:
+            argv += ["--allow-missing-baseline", authorized]
         if scenario_id is not None:
             argv += ["--scenario-id", scenario_id]
         argv += ["--output-dir", str(output)]
@@ -723,6 +725,189 @@ class TestNewDeclarations:
         entry = report["baselines"][0]["scenarios"]["app"]
         assert entry["status"] == "error"
         assert "cannot be empty" in entry["errors"][0]
+
+
+# ---------------------------------------------------------------------------
+# Absent-baseline authorization (bounded opt-in)
+# ---------------------------------------------------------------------------
+
+class TestAbsentBaselineAuthorization:
+    def test_authorized_absent_baseline_is_new(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/old.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(sources=["manifests/added.yaml"])])
+        baseline = repo.commit()
+        repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
+        result, report = repo.check(
+            [baseline], outputs / "r1", mode="enforce", allow_missing=[baseline],
+        )
+        assert result.returncode == 0
+        assert report["status"] == "new"
+        baseline_entry = report["baselines"][0]
+        assert baseline_entry["sha"] == baseline
+        assert baseline_entry["status"] == "new"
+        assert baseline_entry["compatible"] is None
+        entry = baseline_entry["scenarios"]["app"]
+        assert entry["status"] == "new"
+        assert entry["reason"] == (
+            f"authorized absent baseline {baseline}: every selected input is "
+            "absent (--allow-missing-baseline)"
+        )
+        # Candidate validation still ran for the new objects.
+        assert report["candidate"]["scenarios"]["app"]["status"] == "ready"
+
+    def test_absent_baseline_without_authorization_still_fails(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/old.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(sources=["manifests/added.yaml"])])
+        baseline = repo.commit()
+        repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
+        result, report = repo.check([baseline], outputs / "r1")
+        assert result.returncode == 2
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "error"
+        assert "declare an explicit new baselineCase" in entry["errors"][0]
+        assert "--allow-missing-baseline" in entry["errors"][0]
+
+    def test_unrequested_authorization_ref_fails_configuration(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/cm.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        other = repo.commit("an unrelated history commit")
+        result, report = repo.check(
+            [baseline], outputs / "r1", allow_missing=[other],
+        )
+        assert result.returncode == 2
+        assert report["status"] == "error"
+        assert any(
+            "--allow-missing-baseline refs must be requested" in error
+            for error in report["errors"]
+        )
+        # Nothing ran: the configuration failure precedes all processing.
+        assert report["baselines"][0]["status"] == "not-run"
+
+    def test_mutable_authorization_ref_fails_configuration(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/cm.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        result, report = repo.check(
+            [baseline], outputs / "r1", allow_missing=["main"],
+        )
+        assert result.returncode == 2
+        assert any(
+            "--allow-missing-baseline refs must be requested" in error
+            for error in report["errors"]
+        )
+
+    def test_repeated_authorization_refs_are_deterministic(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/old.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(sources=["manifests/added.yaml"])])
+        baseline = repo.commit()
+        repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
+        first, first_report = repo.check(
+            [baseline], outputs / "r1", allow_missing=[baseline, baseline],
+        )
+        second, second_report = repo.check(
+            [baseline], outputs / "r2", allow_missing=[baseline, baseline],
+        )
+        assert first.returncode == second.returncode == 0
+        assert first_report == second_report
+
+    def test_authorized_partial_absence_fails(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/old.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(
+            sources=["manifests/old.yaml", "manifests/added.yaml"],
+        )])
+        baseline = repo.commit()
+        repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
+        result, report = repo.check(
+            [baseline], outputs / "r1", allow_missing=[baseline],
+        )
+        assert result.returncode == 2
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "error"
+        assert "authorized for absent inputs" in entry["errors"][0]
+        assert "partially missing" in entry["errors"][0]
+        assert "manifests/old.yaml" in entry["errors"][0]
+
+    def test_authorization_does_not_force_present_inputs_new(
+            self, repo: Repo, outputs: Path) -> None:
+        # An authorized baseline whose inputs are present compares normally;
+        # the opt-in only classifies wholly absent inputs.
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
+        result, report = repo.check(
+            [baseline], outputs / "r1", mode="enforce", allow_missing=[baseline],
+        )
+        assert result.returncode == 1
+        assert report["status"] == "breaking"
+        assert report["baselines"][0]["status"] == "compared"
+        assert finding_ids(report) == ["storageclass-provisioner-immutable"]
+
+    def test_authorization_cannot_bypass_an_existing_override(
+            self, repo: Repo, outputs: Path) -> None:
+        # An explicit existing override whose historical inputs are absent is
+        # a broken override: the opt-in must not reclassify it as new.
+        repo.write("manifests/old.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(
+            sources=["manifests/old.yaml"],
+            baselineCases=[{"ref": "PENDING", "state": "existing",
+                            "inputs": {"sources": ["manifests/historical.yaml"]}}],
+        )])
+        baseline = repo.commit()
+        descriptor_text = (repo.root / ".rhoai/manifests.yaml").read_text(encoding="utf-8")
+        repo.write(".rhoai/manifests.yaml", descriptor_text.replace("PENDING", baseline))
+        result, report = repo.check(
+            [baseline], outputs / "r1", allow_missing=[baseline],
+        )
+        assert result.returncode == 2
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "error"
+        assert "existing baselineCase override are absent" in entry["errors"][0]
+        assert "cannot be bypassed" in entry["errors"][0]
+
+    def test_mixed_strict_authorized_and_compared_baselines(
+            self, repo: Repo, outputs: Path) -> None:
+        # Strict (undeclared absent), authorized (wholly absent), and compared
+        # baselines coexist in one report with full provenance; the error
+        # dominates the aggregate status and the exit code in both modes.
+        repo.descriptor([repo.raw_scenario(sources=["manifests/sc.yaml"])])
+        strict = repo.commit("history without the scenario sources")
+        authorized = repo.commit("still without the scenario sources")
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        compared = repo.commit("introduce the scenario sources")
+        repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
+
+        result, report = repo.check(
+            [strict, authorized, compared], outputs / "enforce", mode="enforce",
+            allow_missing=[authorized],
+        )
+        assert result.returncode == 2
+        assert report["status"] == "error"
+        strict_entry, authorized_entry, compared_entry = report["baselines"]
+        assert strict_entry["sha"] == strict
+        assert strict_entry["status"] == "error"
+        assert strict_entry["scenarios"]["app"]["status"] == "error"
+        assert authorized_entry["sha"] == authorized
+        assert authorized_entry["status"] == "new"
+        assert authorized_entry["compatible"] is None
+        assert compared_entry["sha"] == compared
+        assert compared_entry["status"] == "compared"
+        assert compared_entry["compatible"] is False
+        assert finding_ids(report, index=2) == ["storageclass-provisioner-immutable"]
+
+        reported, _ = repo.check(
+            [strict, authorized, compared], outputs / "report", mode="report-only",
+            allow_missing=[authorized],
+        )
+        assert reported.returncode == 2
+
 
 
 # ---------------------------------------------------------------------------

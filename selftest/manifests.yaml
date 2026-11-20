@@ -2,23 +2,11 @@
 # with a vendored local dependency and selected values, Kustomize with a
 # generated ConfigMap reference) against the three audited Kubernetes minors.
 #
-# The baselineCases below are the explicit-new bootstrap declarations required
-# when these fixtures were introduced. The refs were verified to contain no
-# selftest/manifests/ tree and no selftest/manifests.yaml:
-#   fab2dfff0566e367e6c0dcf58b475742dfe8649a  main head / pull-request base
-#                                              at fixture introduction
-#                                              (verified 2026-11-06)
-#   8eb288050bb4fb67324935e4bdf6c5c864af7008  task-009 commit, the intended
-#                                              previous-push ref when the
-#                                              fixture commit lands on main
-#                                              (verified 2026-11-06)
-#   d63fe27957117fd99161a693c7fdef9e20efb9d9  main head at PR #20, the
-#                                              pull-request base the manifest
-#                                              self-test runs against
-#                                              (verified 2026-11-20)
-# A later event baseline that still lacks the fixtures but has no declaration
-# fails actionably; update this file only after verifying absence. Baselines
-# that contain the fixtures compare normally without any declaration.
+# Event baselines that predate these fixtures are handled without descriptor
+# declarations: the self-test workflow passes its exact event baseline SHA to
+# the reusable workflow's allow-missing-baseline-refs input, so a baseline
+# whose selected inputs are wholly absent is classified new, a baseline that
+# contains the fixtures compares normally, and partial absence still fails.
 apiVersion: contracts.rhoai.io/v1alpha1
 kind: ManifestSet
 metadata:
@@ -34,16 +22,6 @@ spec:
       kubernetesVersion: 1.37.2
       sources:
         - selftest/manifests/raw/*.yaml
-      baselineCases:
-        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
-          state: new
-          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
-        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
-          state: new
-          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
-        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
-          state: new
-          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"
     - id: helm-app
       renderer: helm
       namespace: default
@@ -55,28 +33,8 @@ spec:
       setValues:
         replicaCount: "3"
       releaseMode: upgrade
-      baselineCases:
-        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
-          state: new
-          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
-        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
-          state: new
-          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
-        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
-          state: new
-          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"
     - id: kustomize-app
       renderer: kustomize
       namespace: selftest
       kubernetesVersion: 1.35.10
       path: selftest/manifests/kustomize/overlay
-      baselineCases:
-        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
-          state: new
-          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
-        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
-          state: new
-          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
-        - ref: d63fe27957117fd99161a693c7fdef9e20efb9d9
-          state: new
-          reason: "main head at PR #20, the pull-request base the self-test runs against: verified to contain no selftest/manifests sources"

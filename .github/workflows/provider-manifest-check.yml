@@ -21,6 +21,13 @@ on:
         description: Space-separated full Git SHAs
         required: true
         type: string
+      allow-missing-baseline-refs:
+        description: Space-separated full Git SHAs from baseline-refs whose wholly absent scenario
+          inputs may be classified as new (event baselines that predate the fixtures); partial
+          absence still fails
+        required: false
+        type: string
+        default: ""
 
 jobs:
   check:
@@ -84,6 +91,7 @@ jobs:
           SCENARIO_ID: ${{ inputs.scenario-id }}
           MODE: ${{ inputs.mode }}
           BASELINE_REFS: ${{ inputs.baseline-refs }}
+          ALLOW_MISSING_BASELINE_REFS: ${{ inputs.allow-missing-baseline-refs }}
           TOOL_CACHE_DIR: ${{ runner.temp }}/manifest-tool-cache
         run: python3 .contract-tests/cmd/workflow-steps/steps.py run manifest
 

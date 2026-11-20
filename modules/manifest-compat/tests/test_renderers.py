@@ -1262,6 +1262,63 @@ class TestHelmRender:
         assert excinfo.value.missing == ["charts/absent"]
         assert excinfo.value.matched == []
 
+    def test_absent_chart_with_present_values_is_partial(self, tmp_path: Path) -> None:
+        # Selected values files are classified before the chart's absence is
+        # declared: a present values file means the source set is partial,
+        # never a wholly absent (new-eligible) scenario.
+        repo = build_repo(tmp_path, copies={"chart": "charts/demo"})
+        records, _ = snap_candidate(repo, tmp_path)
+        scenario = helm_scenario(
+            path="charts/absent", valuesFiles=["charts/demo/values.yaml"],
+        )
+        with pytest.raises(MissingInputError) as excinfo:
+            renderers.render(records, scenario, prepared_cache(tmp_path, "helm"))
+        assert excinfo.value.missing == ["charts/absent"]
+        assert excinfo.value.matched == ["charts/demo/values.yaml"]
+
+    def test_absent_chart_with_absent_values_reports_every_input(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, copies={"chart": "charts/demo"})
+        records, _ = snap_candidate(repo, tmp_path)
+        scenario = helm_scenario(
+            path="charts/absent", valuesFiles=["charts/absent-values.yaml"],
+        )
+        with pytest.raises(MissingInputError) as excinfo:
+            renderers.render(records, scenario, prepared_cache(tmp_path, "helm"))
+        assert excinfo.value.missing == ["charts/absent", "charts/absent-values.yaml"]
+        assert excinfo.value.matched == []
+
+    @pytest.mark.parametrize("hazard", ["gitlink", "symlink", "lfs-pointer"])
+    def test_chart_root_hazard_is_not_an_absent_chart(
+        self, tmp_path: Path, hazard: str,
+    ) -> None:
+        # An exact chart root that is a gitlink, symlink, or LFS pointer is a
+        # malformed input, not a missing one: absence classification must not
+        # turn it into an authorizable new scenario.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        if hazard == "gitlink":
+            commit_extra_file(repo, "charts/demo", "", mode="160000", working_copy=False)
+        elif hazard == "symlink":
+            (repo / "charts").mkdir()
+            os.symlink("/etc/passwd", repo / "charts/demo")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "symlink chart root")
+        else:
+            (repo / "charts").mkdir()
+            (repo / "charts/demo").write_bytes(LFS_POINTER)
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "lfs chart root")
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be safely materialized"):
+            renderers.render(records, helm_scenario(), prepared_cache(tmp_path, "helm"))
+
+    def test_chart_root_regular_file_is_malformed(self, tmp_path: Path) -> None:
+        # A regular file where the chart directory is required is a wrong-kind
+        # input, not an absent chart.
+        repo = build_repo(tmp_path, files={"charts/demo": "not a directory\n"})
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="is a regular file, not a chart directory"):
+            renderers.render(records, helm_scenario(), prepared_cache(tmp_path, "helm"))
+
     def test_missing_chart_yaml(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"charts/demo/templates/cm.yaml": "kind: ConfigMap\n"})
         records, _ = snap_candidate(repo, tmp_path)
@@ -1569,6 +1626,40 @@ class TestKustomizeRender:
         with pytest.raises(MissingInputError) as excinfo:
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
         assert excinfo.value.missing == ["manifests/overlays/prod"]
+
+    @pytest.mark.parametrize("hazard", ["gitlink", "symlink", "lfs-pointer"])
+    def test_overlay_root_hazard_is_not_an_absent_path(
+        self, tmp_path: Path, hazard: str,
+    ) -> None:
+        # An exact overlay root that is a gitlink, symlink, or LFS pointer is
+        # a malformed input, not a missing one: absence classification must
+        # not turn it into an authorizable new scenario.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        if hazard == "gitlink":
+            commit_extra_file(
+                repo, "manifests/overlays/prod", "", mode="160000", working_copy=False,
+            )
+        elif hazard == "symlink":
+            (repo / "manifests/overlays").mkdir(parents=True)
+            os.symlink("/etc/passwd", repo / "manifests/overlays/prod")
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "symlink overlay root")
+        else:
+            (repo / "manifests/overlays").mkdir(parents=True)
+            (repo / "manifests/overlays/prod").write_bytes(LFS_POINTER)
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "lfs overlay root")
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be safely materialized"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_overlay_root_regular_file_is_malformed(self, tmp_path: Path) -> None:
+        repo = build_repo(
+            tmp_path, files={"manifests/overlays/prod": "not a directory\n"},
+        )
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="is a regular file, not a kustomization directory"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
 
     def test_directory_without_kustomization_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"manifests/overlays/prod/deployment.yaml": "kind: Deployment\n"})

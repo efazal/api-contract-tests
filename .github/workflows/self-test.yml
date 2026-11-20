@@ -43,10 +43,12 @@ jobs:
       yq-version: "4.45.1"
 
   # Each manifest scenario goes through the real reusable workflow with the
-  # real pinned go-run renderers. The baseline refs follow the same PR-base /
-  # previous-push convention as the other self-tests; the explicit-new
-  # bootstrap declarations for the fixture-introduction refs live in
-  # selftest/manifests.yaml and must be updated only after verified absence.
+  # real pinned go-run renderers. The baseline ref follows the same PR-base /
+  # previous-push convention as the other self-tests. The event baseline can
+  # predate the selftest fixtures, so it is also passed to the bounded
+  # absent-input authorization: only that exact requested SHA may be
+  # classified new when its inputs are wholly absent, and baselines that
+  # contain the fixtures compare normally without any descriptor declaration.
   manifest:
     strategy:
       fail-fast: false
@@ -58,3 +60,4 @@ jobs:
       scenario-id: ${{ matrix.scenario }}
       mode: enforce
       baseline-refs: ${{ github.event.pull_request.base.sha || github.event.before }}
+      allow-missing-baseline-refs: ${{ github.event.pull_request.base.sha || github.event.before }}

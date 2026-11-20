@@ -133,6 +133,27 @@ def _required_baseline_args(env: Mapping[str, str]) -> list[str]:
     return _baseline_args(env)
 
 
+def _allow_missing_baseline_args(env: Mapping[str, str]) -> list[str]:
+    """Opt-in flags authorizing wholly absent inputs per requested baseline.
+
+    The authorization must be an exact subset of the requested baselines: an
+    unrequested or malformed ref fails configuration instead of silently
+    enabling absence classification for a baseline nobody asked about. An
+    empty input enables nothing.
+    """
+    refs = env.get("ALLOW_MISSING_BASELINE_REFS", "").split()
+    if not refs:
+        return []
+    requested = set(env.get("BASELINE_REFS", "").split())
+    unrequested = [ref for ref in refs if ref not in requested]
+    if unrequested:
+        raise InputError(
+            "allow-missing-baseline-refs must be a subset of baseline-refs; "
+            f"not requested: {' '.join(unrequested)}"
+        )
+    return [flag for ref in refs for flag in ("--allow-missing-baseline", ref)]
+
+
 def _manifest_set(env: Mapping[str, str]) -> str:
     """The ManifestSet descriptor path, defaulting to .rhoai/manifests.yaml."""
     manifest_set = (env.get("MANIFEST_SET") or "").strip() or ".rhoai/manifests.yaml"
@@ -215,6 +236,7 @@ def check_args(check: str, env: Mapping[str, str], workspace: Path) -> list[str]
         if scenario_id:
             args += ["--scenario-id", scenario_id]
         args += _required_baseline_args(env)
+        args += _allow_missing_baseline_args(env)
         args += ["--output-dir", report_dir]
         cache = _tool_cache_dir(env, workspace, required=False)
         if cache is not None:
