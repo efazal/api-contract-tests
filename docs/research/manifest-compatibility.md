@@ -101,7 +101,7 @@ Only three evidence classes may block:
 | PodCertificateRequest (`certificates.k8s.io/v1`, 1.37) | entire `spec` | earlier beta form inventory-only |
 | StorageVersionMigration (`storagemigration.k8s.io/v1`, 1.37) | entire `spec` | earlier beta form inventory-only |
 | PersistentVolume | `spec.persistentVolumeSource` union, `spec.volumeMode` (default `Filesystem`) | One-time `csi.controllerExpandSecretRef` initialization allowed; `persistentVolumeReclaimPolicy` is **mutable** |
-| PersistentVolumeClaim | `spec.accessModes`, `spec.selector`, `spec.dataSource`, `spec.dataSourceRef`, `spec.volumeMode` | One-time `volumeName` initialization; exact `storageClassName` beta-annotation and nil migrations allowed |
+| PersistentVolumeClaim | `spec.accessModes`, `spec.selector`, `spec.dataSource`, `spec.dataSourceRef`, `spec.volumeMode` | One-time `volumeName` initialization; `storageClassName` permits exactly two source-verified migrations — unset to set (the audited validator accepts nil→`""`; this is the corrected premise, not a universal API rejection) and the beta annotation to an equal field value |
 | Service | Primary `clusterIPs[0]` once set; primary IP family; `loadBalancerClass` while both types are LoadBalancer; `healthCheckNodePort` while both need Local LB health checks | ExternalName and headless transitions exempt; validated secondary-family add/remove; `type`, `selector`, `nodePort` mutable |
 
 Removed kind-specific checks: the kind-specific immutable/transition rules for
@@ -181,7 +181,10 @@ These facts contradict common intuition and are deliberately encoded:
 
 - Rendering is offline and pinned: `go run helm.sh/helm/v4/cmd/helm@v4.3.1`
   and `go run sigs.k8s.io/kustomize/kustomize/v5@v5.8.3` only, with a
-  separately prepared module cache and no network during checks. Helm's
+  separately prepared module cache, the module proxy pointed at that cache,
+  and allowlisted subprocess environments during checks. This is
+  tool-configuration isolation; no OS-enforced network or filesystem sandbox
+  is present. Helm's
   supported template subset rejects any `lookup` or `tpl` function use in
   chart or vendored-subchart templates, because dynamically assembled lookup
   execution cannot be excluded by determinism checks alone.
@@ -217,4 +220,9 @@ Follow-on work, explicitly out of the first delivery:
 6. Optional server-side validation tier (`--dry-run=server` or envtest) for
    rules that currently warn on live-state dependencies.
 7. Repository-wide scenario discovery and coverage enforcement for chart and
-   overlay inventories.
+   overlay inventories: identifying installation roots versus bases,
+   dependencies, and examples; mapping them to scenarios with intentional
+   exclusions; and integrating the resulting diagnostics into the coverage
+   check and workflow enforcement. Until it exists, `ManifestSet`
+   completeness is a descriptor-review responsibility — the OpenAPI/CRD
+   coverage inventory cannot detect an undeclared chart or overlay.

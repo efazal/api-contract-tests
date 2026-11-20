@@ -72,8 +72,11 @@ with only exclusions.
 
 Kubernetes manifest checks (see the
 [manifest onboarding guide](../../docs/onboarding/manifest-compat.md)).
-Preparation is the only network-enabled step and needs Go >= 1.27 on PATH; the
-check itself is offline:
+Preparation is the only step that needs the network and needs Go >= 1.27 on
+PATH; the check itself runs the renderers with the module proxy pointed at
+the prepared cache (tool-configuration isolation — there is no OS-enforced
+network sandbox). The check enforces by default; pass `--report-only` to
+record findings without failing:
 
 ```bash
 # Once per cache location, with network: fetch and verify the pinned go-run
@@ -83,14 +86,15 @@ python3 cmd/contract-tests/cli.py manifest-prepare \
   --manifest-set .rhoai/manifests.yaml \
   --tool-cache-dir /tmp/manifest-tools
 
-# Offline, on every change. --tool-cache-dir is required only when the
+# On every change. --tool-cache-dir is required only when the
 # selected scenarios render (raw-only selections need no Go).
 python3 cmd/contract-tests/cli.py manifest-check \
   --repo /path/to/provider/checkout \
   --manifest-set .rhoai/manifests.yaml \
   --baseline-ref <full-git-sha> [--baseline-ref <full-git-sha> ...] \
+  [--allow-missing-baseline <full-git-sha> ...] \
   --output-dir /tmp/manifest-report \
-  [--tool-cache-dir /tmp/manifest-tools] [--scenario-id <id>] [--enforce]
+  [--tool-cache-dir /tmp/manifest-tools] [--scenario-id <id>] [--report-only]
 ```
 
 `manifest-check` exits 0 for `compatible` and `new` (and for `breaking`

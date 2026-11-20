@@ -19,6 +19,8 @@ repository supplies the shared checks and result format.
   [manifest onboarding guide](docs/onboarding/manifest-compat.md).
 - The coverage check (`coverage`) confirms every OpenAPI document and CRD in a
   repository is registered; `discover` inventories a repository for onboarding.
+  It inventories OpenAPI documents and CRDs only: it cannot detect a chart or
+  overlay missing from the manifest check's descriptor.
 - The local runner is `cmd/contract-tests/cli.py`.
 - Provider onboarding is opt-in and runs in enforce mode, the default for the
   reusable workflows and the CLI; see

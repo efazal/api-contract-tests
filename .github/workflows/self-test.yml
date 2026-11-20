@@ -39,6 +39,11 @@ jobs:
     with:
       contract-set: selftest/contracts.yaml
       crd-globs: selftest/crd/*.yaml
+      # The kustomize renderer fixture CRD is test data for the manifest
+      # checks, not a served API of this repository: it is discovered by the
+      # repo-wide CRD scan (it is a well-formed CRD) and deliberately excluded
+      # here rather than demanded as covered.
+      crd-exclude-globs: modules/manifest-compat/tests/fixtures/renderers/kustomize/overlays/prod/crds/example-crd.yaml
       mode: enforce
       yq-version: "4.45.1"
 

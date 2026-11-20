@@ -17,10 +17,15 @@ own pull request instead of first running when a provider bumps its pin.
 Each check compares against the pull request's base commit (or the previous
 `main` commit on push), so the self-test fails if a pull request makes a breaking
 change to these fixtures. Change them only in compatible ways, or update the
-baseline expectations in the same pull request. The manifest descriptor's
-`baselineCases` declare the fixture-introduction refs as explicitly new (with
-verified reasons); update those declarations only after verifying absence at
-the new event refs.
+baseline expectations in the same pull request. The manifest check passes its
+exact event baseline to the reusable workflow's `allow-missing-baseline-refs`
+input, so an event baseline that predates the fixtures is classified new with
+no descriptor declaration: the manifest descriptor carries no per-ref
+`baselineCases` to keep current. The kustomize renderer fixture CRD under
+`modules/manifest-compat/tests/fixtures/` is deliberate test data, not a
+served API of this repository; the coverage job excludes it through the
+CRD-exclusion facility (`crd-exclude-globs`), and the OpenAPI renderer
+fixture through the ContractSet's `exclusions`.
 
 A local call has no SHA to pin, so the workflows' pin requirement is waived when
 the caller is this repository (see `require_pinned_ref` in

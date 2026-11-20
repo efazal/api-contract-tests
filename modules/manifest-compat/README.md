@@ -68,10 +68,13 @@ of error, warn, or info; error findings block in enforce mode.
   (`pv-volume-source-immutable`, `pv-volume-mode-immutable`,
   `pv-node-affinity-risk`, `pv-volume-attributes-class-name-risk`).
 - `PersistentVolumeClaim`: `accessModes`, `selector`, `dataSource`,
-  `dataSourceRef`, and `volumeMode` are immutable; `volumeName` and
-  `storageClassName` are transition-validated; storage expansion and
-  `volumeAttributesClassName` changes are warned as risk
-  (`pvc-access-modes-immutable`, `pvc-selector-immutable`,
+  `dataSourceRef`, and `volumeMode` are immutable; `volumeName` is
+  one-time-initialized from unset; `storageClassName` permits exactly the two
+  source-verified migrations — unset to set (the audited API accepts
+  nil→`""`, so this is not documented as a universal rejection) and the beta
+  annotation to an equal field value — and errors on everything else;
+  storage expansion and `volumeAttributesClassName` changes are warned as
+  risk (`pvc-access-modes-immutable`, `pvc-selector-immutable`,
   `pvc-data-source-immutable`, `pvc-data-source-ref-immutable`,
   `pvc-volume-mode-immutable`, `pvc-volume-name-immutable`,
   `pvc-storage-class-name-immutable`, `pvc-storage-resize-risk`,
@@ -167,11 +170,15 @@ of error, warn, or info; error findings block in enforce mode.
 
 Renders run through `go run helm.sh/helm/v4/cmd/helm@v4.3.1` and
 `go run sigs.k8s.io/kustomize/kustomize/v5@v5.8.3` — never installed
-binaries. `manifest-prepare` is the only network-enabled step: it fetches and
-checksum-verifies the exact modules into a caller-selected cache outside the
-provider checkout and proves the cache renders offline. `manifest-check` then
-renders strictly offline, with the module proxy pointed at the prepared cache
-itself, and fails closed on a missing or unusable cache. Helm templates may
+binaries. `manifest-prepare` is the only step that needs the network: it
+fetches and checksum-verifies the exact modules into a caller-selected cache
+outside the provider checkout and proves the cache renders offline.
+`manifest-check` then renders with the module proxy pointed at the prepared
+cache itself and fails closed on a missing or unusable cache. Renderer
+subprocesses run in isolated working directories with allowlisted
+environments, and charts and overlays may reference only local paths inside
+the repository — but this is tool-configuration isolation, not OS-enforced
+network or filesystem sandboxing. Helm templates may
 not use `lookup` or `tpl`; every render runs twice and must be
 byte-deterministic. Helm hook objects and CustomResourceDefinitions are
 skipped and recorded (CRDs belong to the CRD compatibility check).

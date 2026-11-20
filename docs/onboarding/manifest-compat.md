@@ -142,10 +142,10 @@ Rendering uses pinned `go run` commands —
 `helm.sh/helm/v4/cmd/helm@v4.3.1` and
 `sigs.k8s.io/kustomize/kustomize/v5@v5.8.3`, the only supported pins — and
 never installed Helm or Kustomize binaries. `manifest-prepare` is the only
-network-enabled step: it
-downloads the exact modules through Go's normal checksum verification into a
-cache you choose, primes them, and re-runs each pinned `version` command
-offline to prove the cache is render-ready.
+step that needs the network: it downloads the exact modules through Go's
+normal checksum verification into a cache you choose, primes them, and
+re-runs each pinned `version` command offline to prove the cache is
+render-ready.
 
 ```bash
 # Needs Go >= 1.27 on PATH (the pinned Kustomize requires it) and network.
@@ -172,11 +172,20 @@ python3 /path/to/api-contract-tests/cmd/contract-tests/cli.py manifest-check \
   --tool-cache-dir /tmp/manifest-tools
 ```
 
+The check **enforces by default**: error findings exit 1. Pass `--report-only`
+to record them without failing; the flag exists for first runs and review
+workflows, not for steady state. (`--enforce` is still accepted and states
+the default.)
+
 Notes:
 
 - `--baseline-ref` accepts **full Git SHAs only**, repeat the flag for
   several baselines (each is resolved and compared independently). Mutable
   refs (`main`, tags, branches, `HEAD`) are rejected.
+- `--allow-missing-baseline <full-sha>` (repeatable) authorizes one
+  requested baseline to classify wholly absent scenario inputs as new —
+  see [baselines](#5-baselines-compared-moved-and-new). Any ref it names
+  that was not requested as `--baseline-ref` fails configuration.
 - `--output-dir` must not exist yet; the check never overwrites a previous
   report.
 - The candidate is the **working tree** (uncommitted changes included), so
@@ -194,10 +203,10 @@ Exit codes and `report.json.status`:
 | Exit | Status | Meaning |
 | --- | --- | --- |
 | 0 | `compatible` | Compared, no unsuppressed error findings (warnings may exist) |
-| 0 | `new` | No scenario compared at any baseline (all declared new) |
+| 0 | `new` | No scenario compared at any baseline (all new: declared, or authorized absent inputs) |
 | 0 | `breaking` | Error findings exist, but the run is report-only |
-| 1 | `breaking` | Error findings exist and `--enforce` was passed |
-| 2 | `error` | Infrastructure or integrity failure: unresolvable baseline, render failure, unusable cache, malformed descriptor |
+| 1 | `breaking` | Error findings exist and the run enforces (the default) |
+| 2 | `error` | Infrastructure or integrity failure: unresolvable baseline, render failure, unusable cache, malformed descriptor, or invalid absence authorization |
 
 Read `report.json`, not only the exit code. Per baseline you get a status of
 `new`, `compared`, `error`, or `not-run` (blocked by an earlier failure), a
@@ -244,6 +253,29 @@ scenarios:
 - Once a baseline contains the fixtures, ordinary comparisons happen with no
   declaration at all; leftover declarations for older refs are harmless
   unused provenance.
+
+**SHA-scoped authorization for moving event baselines.** Event-driven
+baselines move: the pull-request base SHA or the previous-push SHA changes on
+every update, so per-ref declarations do not fit. When you control the
+invocation, pass the exact event SHA to the CLI's repeatable
+`--allow-missing-baseline <full-sha>` (the reusable workflow's
+`allow-missing-baseline-refs` input; see
+[Add CI](#7-add-ci) for the event-expression example). The rules are
+deliberately narrow:
+
+- The authorization must name requested `--baseline-ref` SHAs; anything else
+  fails configuration before any rendering runs.
+- An authorized baseline whose selected inputs are **wholly absent** is
+  classified new, with a report reason naming the opt-in — a moving event
+  baseline that predates your fixtures needs no descriptor edit.
+- An authorized baseline whose inputs are **partially present** (chart
+  present, selected values file absent) still fails: partial absence is a
+  broken source set, not a new scenario.
+- An authorized baseline whose inputs are present compares normally — the
+  opt-in never forces present inputs new.
+- Explicit `baselineCases` keep precedence: a `state: existing` override
+  whose historical inputs are absent is a broken override, and the
+  authorization cannot reclassify it as new.
 
 **Empty renders have asymmetric meaning.** A candidate that renders zero
 objects is a valid, successful render: every baseline object was removed,
@@ -302,7 +334,7 @@ example) needs no exception: the old generated object's removal is an
 ordinary `resource-removed` warning and the retargeted reference is followed
 to the new name. No hash-suffix heuristics are used.
 
-## 7. Add CI (report mode first)
+## 7. Add CI
 
 Call the reusable workflow, pinned to a release that contains it. The
 manifest workflow is new: use the **first release that ships
@@ -316,12 +348,39 @@ jobs:
     with:
       manifest-set: .rhoai/manifests.yaml
       baseline-refs: <full-trusted-sha>        # space-separated for several
-      mode: report
+      mode: enforce
 ```
 
 The workflow prepares the pinned tools into a runner-temp cache (the only
-network-enabled step), runs the check offline, and summarizes/uploads the
-report on every outcome. To check scenarios separately, add a matrix:
+step that needs the network), runs the check with the renderers pointed at
+that cache, and summarizes/uploads the report on every outcome.
+
+`mode: enforce` is the workflow's default for new callers, but keep setting
+it explicitly: releases up to and including `v1.1.0` defaulted `mode` to
+`report`, so a caller pinned to one of them that omits `mode` gets a job
+that stays green on a breaking change. `mode: report` records findings
+without failing — reasonable for a first run while findings are reviewed and
+consumers agree; it is not a steady state. Warnings never block in either
+mode; only error-severity findings do, and only in enforce mode. Making the
+job required is your repository's branch-protection decision.
+
+**Moving event baselines.** When the baseline is the pull-request base — or,
+after merge, the previous push — pass the same expression to
+`allow-missing-baseline-refs` so an event baseline that predates your
+fixtures is classified new without a descriptor edit (the semantics are in
+[baselines](#5-baselines-compared-moved-and-new)):
+
+```yaml
+  manifest-contract:
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-manifest-check.yml@v1.1.0  # TODO: same pin as above
+    with:
+      manifest-set: .rhoai/manifests.yaml
+      baseline-refs: ${{ github.event.pull_request.base.sha || github.event.before }}
+      allow-missing-baseline-refs: ${{ github.event.pull_request.base.sha || github.event.before }}
+      mode: enforce
+```
+
+To check scenarios separately, add a matrix:
 
 ```yaml
   manifest-contract:
@@ -333,34 +392,33 @@ report on every outcome. To check scenarios separately, add a matrix:
     with:
       scenario-id: ${{ matrix.scenario }}
       baseline-refs: <full-trusted-sha>
-      mode: report
+      mode: enforce
 ```
 
 Use full SHAs of commits you trust as released — typically the merge commit
 of your last release — the same discipline as the
 [OpenAPI baselines](openapi-compat.md#baselines).
 
-**Moving to enforce.** Stay in report mode until findings are reviewed and
-consumers agree, then change `mode: report` to `mode: enforce`. Warnings
-never block in either mode; only error-severity findings do, and only in
-enforce mode. Making the job required is your repository's branch-protection
-decision.
-
 **Protect the configuration.** The descriptor, baseline commits, and
 exceptions are what keep the check honest. Make them code-owned (a
 `CODEOWNERS` entry for `.rhoai/`), and route changes to baselines,
 protected contracts, and exceptions through review by someone other than the
-author — ideally including the contract working group. An exception or a
-`state: new` declaration is an accepted break in writing; treat editing one
-like editing the policy.
+author — ideally including the contract working group. An exception, a
+`state: new` declaration, or an absent-input authorization is an accepted
+break in writing; treat editing one like editing the policy.
 
 ## 8. Rendering limits and failure behavior
 
-- **Offline by construction.** During `manifest-check`, every renderer
-  subprocess runs with the module proxy pointed at the prepared cache itself
-  and the checksum database disabled; no network path exists. Reports and
-  artifacts contain no raw rendered manifests, values, or Secret values —
-  only file inventories, digests, and sanitized diagnostics.
+- **Offline by configuration, not by OS sandbox.** During `manifest-check`,
+  every renderer subprocess runs in an isolated working directory and a
+  clean home, with an allowlisted environment, the module proxy pointed at
+  the prepared cache itself, and the checksum database disabled; charts and
+  overlays may reference only local paths inside the repository, and remote
+  references fail closed. These are tool-configuration guarantees:
+  OS-enforced network and filesystem isolation is **not** present, so a
+  renderer escaping them would be a bug to fix, not a blocked escape.
+  Reports and artifacts contain no raw rendered manifests, values, or Secret
+  values — only file inventories, digests, and sanitized diagnostics.
 - **Determinism is enforced.** Every render runs twice and the outputs must
   be byte-identical; non-deterministic templates fail the run.
 - **Helm hooks and CRDs are skipped and recorded.** Hook-annotated objects
