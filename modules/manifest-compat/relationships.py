@@ -888,6 +888,15 @@ def _compare_selector_graph(
         candidate: dict[ObjectKey, dict[str, Any]]) -> set[tuple[ObjectKey, str, str]]:
     """Emit selector-graph findings; return label keys with stronger evidence.
 
+    Selector loss is a match-set fact, not a per-identity fact: an unchanged
+    explicit selector errors only when it selected at least one local target
+    in the baseline and selects none in the candidate. Select-all selectors
+    (empty PodDisruptionBudget selectors, empty or absent NetworkPolicy
+    podSelectors) match any present target and never produce removal-based
+    loss; renames, replacements and partial losses that keep at least one
+    local match stay legal. Baseline removal and label-drift warnings, and
+    the protected-resource error, cover those cases independently.
+
     The returned set holds (target identity, labels pointer, label key)
     triples whose change already produced a selector-target-lost error, so
     label-drift warnings are not duplicated for them (label drift warns
@@ -915,6 +924,22 @@ def _compare_selector_graph(
         if mode_b == "none":
             continue
         selected_b = _selected_targets(baseline_targets, namespace, mode_b, form_b)
+        if not selected_b:
+            # The selector matched no local baseline target, so no proven
+            # selection relationship existed to lose.
+            continue
+        if mode_b == "all":
+            # A select-all selector matches whatever is present, so removal
+            # or relabeling of individual targets cannot end its selection.
+            continue
+        selected_c = _selected_targets(candidate_targets, namespace, mode_b, form_b)
+        if selected_c:
+            # At least one local candidate target still matches: a
+            # replacement, rename or partial loss is not total selector loss.
+            continue
+        # Total loss of local matches under an unchanged explicit selector:
+        # retain one relational finding per baseline target with its stable
+        # edge identity so exceptions and correlation keep working.
         for target_key, (labels_b, target_path) in selected_b.items():
             if target_key not in candidate:
                 findings.append(_selector_target_lost(
@@ -922,8 +947,6 @@ def _compare_selector_graph(
                     "the target disappeared from the candidate render"))
                 continue
             labels_c = candidate_targets.get(target_key, ({}, target_path))[0]
-            if mode_b == "all" or (form_b is not None and _form_matches(form_b, labels_c)):
-                continue
             findings.append(_selector_target_lost(
                 scenario_id, key, selector_path, target_key, target_path,
                 "the target template labels changed"))

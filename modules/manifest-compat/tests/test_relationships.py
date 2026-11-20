@@ -571,15 +571,128 @@ class TestSelectorTargetGraph:
         )
         assert ids_of(findings) == ["label-value-changed"]
 
-    def test_pdb_empty_selector_loses_disappeared_target(self) -> None:
+    def test_pdb_empty_selector_tolerates_disappeared_target(self) -> None:
+        # An empty PDB selector selects all pods; removing one workload (or
+        # all of them) does not end that selection, so only the baseline
+        # removal warning fires.
         findings = compare(
             [pdb("budget", selector={}),
              workload("Deployment", "web", template_labels={"app": "web"})],
             [pdb("budget", selector={})],
         )
-        assert ids_of(findings) == ["resource-removed", "selector-target-lost"]
-        assert findings_for(findings, "selector-target-lost")[0][
-            "related_resource"] == identity_of(DEP_KEY)
+        assert ids_of(findings) == ["resource-removed"]
+        assert findings_for(findings, "resource-removed")[0]["severity"] == "warn"
+
+    def test_pdb_empty_selector_tolerates_removal_of_every_target(self) -> None:
+        findings = compare(
+            [pdb("budget", selector={}),
+             workload("Deployment", "web", template_labels={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "api"})],
+            [pdb("budget", selector={})],
+        )
+        assert ids_of(findings) == ["resource-removed", "resource-removed"]
+        assert findings_for(findings, "selector-target-lost") == []
+
+    def test_networkpolicy_absent_pod_selector_tolerates_disappeared_target(self) -> None:
+        # An absent NetworkPolicy podSelector selects all local pods, so a
+        # removal cannot prove a lost selection relationship.
+        findings = compare(
+            [networkpolicy("np"), pod("p", labels={"app": "a"})],
+            [networkpolicy("np")],
+        )
+        assert ids_of(findings) == ["resource-removed"]
+
+    def test_matching_replacement_is_not_total_loss(self) -> None:
+        # A renamed workload whose replacement still carries the selected
+        # labels keeps the selection alive: only the removal warning fires.
+        findings = compare(
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"})],
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web-v2", template_labels={"app": "web"})],
+        )
+        assert ids_of(findings) == ["resource-removed"]
+        assert findings_for(findings, "selector-target-lost") == []
+
+    def test_partial_label_drift_with_remaining_match_is_not_loss(self) -> None:
+        # One of two selected targets drifts away while the other still
+        # matches: not total loss, and the drift warning is not suppressed.
+        findings = compare(
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "web"})],
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "other"})],
+        )
+        assert findings_for(findings, "selector-target-lost") == []
+        assert ids_of(findings) == ["label-value-changed"]
+
+    def test_total_loss_retains_per_target_relational_evidence(self) -> None:
+        # When every local match is lost, each baseline target keeps its own
+        # finding and stable edge identity so existing exceptions still match.
+        findings = compare(
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "web"})],
+            [service("svc", selector={"app": "web"}),],
+        )
+        lost = findings_for(findings, "selector-target-lost")
+        assert len(lost) == 2
+        edges = {finding["edge_id"] for finding in lost}
+        assert len(edges) == 2
+        related = {finding["related_resource"]["name"] for finding in lost}
+        assert related == {"web", "api"}
+        assert all(finding["path_origin"] == "baseline" for finding in lost)
+
+    def test_selector_without_baseline_matches_stays_silent(self) -> None:
+        # A selector that never selected a local target cannot prove a loss.
+        findings = compare(
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "api"})],
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "api", template_labels={"app": "other"})],
+        )
+        assert findings_for(findings, "selector-target-lost") == []
+
+    def test_service_match_expressions_total_loss(self) -> None:
+        selector = {"matchExpressions": [
+            {"key": "env", "operator": "In", "values": ["dev"]}]}
+        findings = compare(
+            [service("svc", selector=selector),
+             workload("Deployment", "web",
+                      template_labels={"app": "web", "env": "dev"})],
+            [service("svc", selector=selector),
+             workload("Deployment", "web",
+                      template_labels={"app": "web", "env": "prod"})],
+        )
+        # The referenced-key drift is suppressed by the stronger loss error.
+        assert ids_of(findings) == ["selector-target-lost"]
+        assert findings[0]["resource"] == identity_of(SVC_KEY)
+
+    def test_networkpolicy_explicit_selector_total_loss(self) -> None:
+        findings = compare(
+            [networkpolicy("np", pod_selector={"app": "web"}),
+             pod("p", labels={"app": "web"})],
+            [networkpolicy("np", pod_selector={"app": "web"}),
+             pod("p", labels={"app": "other"})],
+        )
+        assert ids_of(findings) == ["selector-target-lost"]
+        assert findings[0]["path"] == "/spec/podSelector"
+
+    def test_match_relocated_to_another_namespace_is_total_loss(self) -> None:
+        # Matches are same-namespace: a replacement that only exists in
+        # another namespace leaves the consumer with zero local matches.
+        findings = compare(
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"})],
+            [service("svc", selector={"app": "web"}),
+             workload("Deployment", "web", template_labels={"app": "web"},
+                      namespace="other-ns")],
+        )
+        lost = findings_for(findings, "selector-target-lost")
+        assert len(lost) == 1
+        assert lost[0]["resource"] == identity_of(SVC_KEY)
 
     def test_pdb_nil_selector_selects_nothing(self) -> None:
         findings = compare(
@@ -596,13 +709,6 @@ class TestSelectorTargetGraph:
             [networkpolicy("np", pod_selector={}), pod("p", labels={"app": "b"})],
         )
         assert ids_of(findings) == ["label-value-changed"]
-
-    def test_networkpolicy_absent_pod_selector_loses_disappeared_target(self) -> None:
-        findings = compare(
-            [networkpolicy("np"), pod("p", labels={"app": "a"})],
-            [networkpolicy("np")],
-        )
-        assert ids_of(findings) == ["resource-removed", "selector-target-lost"]
 
     def test_service_absent_selector_selects_nothing(self) -> None:
         findings = compare(
