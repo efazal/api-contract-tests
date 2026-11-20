@@ -163,11 +163,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest_check.add_argument("--tool-cache-dir", type=Path,
                                 help="Cache directory holding the prepared pinned renderer modules; required "
                                      "when any selected scenario renders with Helm or Kustomize")
-    manifest_check.add_argument("--enforce", action="store_true",
-                                help="Exit 1 for breaking changes; default is report-only")
+    _add_mode_arguments(manifest_check)
 
     args = parser.parse_args(argv)
-    if args.command in ("check", "crd-check"):
+    if args.command in ("check", "crd-check", "manifest-check"):
         args.enforce = not args.report_only
     # The checker modules are loaded at runtime, so their return values are untyped here.
     code: int

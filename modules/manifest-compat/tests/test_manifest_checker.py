@@ -245,7 +245,7 @@ class Repo:
         self.git("commit", "-q", "--allow-empty", "-m", message)
         return self.git("rev-parse", "HEAD")
 
-    def check(self, baselines: list[str], output: Path, *, enforce: bool = False,
+    def check(self, baselines: list[str], output: Path, *, mode: str = "enforce",
               scenario_id: str | None = None,
               manifest_set: str = ".rhoai/manifests.yaml") -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
         argv = [sys.executable, str(CLI), "manifest-check",
@@ -255,8 +255,7 @@ class Repo:
         if scenario_id is not None:
             argv += ["--scenario-id", scenario_id]
         argv += ["--output-dir", str(output)]
-        if enforce:
-            argv.append("--enforce")
+        argv += ["--enforce"] if mode == "enforce" else ["--report-only"]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=ENV)
         report = json.loads((output / "report.json").read_text(encoding="utf-8"))
         return result, report
@@ -368,7 +367,7 @@ class TestCheckStatusMatrix:
         repo.write("manifests/sc.yaml", STORAGE_CLASS)
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0, result.stderr
         assert report["status"] == "compatible"
         assert report["mode"] == "enforce"
@@ -382,7 +381,7 @@ class TestCheckStatusMatrix:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
-        result, report = repo.check([baseline], outputs / "r1")
+        result, report = repo.check([baseline], outputs / "r1", mode="report-only")
         assert result.returncode == 0
         assert report["status"] == "breaking"
         finding = finding_for(report, "storageclass-provisioner-immutable")
@@ -402,17 +401,46 @@ class TestCheckStatusMatrix:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         assert report["status"] == "breaking"
         assert report["baselines"][0]["compatible"] is False
+
+    def test_enforce_is_the_default_without_mode_flags(self, repo: Repo, outputs: Path) -> None:
+        # Omitted mode flags mean enforce, matching check and crd-check: a
+        # breaking change exits 1 and the report records enforce mode.
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
+        argv = [sys.executable, str(CLI), "manifest-check",
+                "--repo", str(repo.root), "--manifest-set", ".rhoai/manifests.yaml",
+                "--baseline-ref", baseline, "--output-dir", str(outputs / "r1")]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=ENV)
+        report = json.loads((outputs / "r1" / "report.json").read_text(encoding="utf-8"))
+        assert result.returncode == 1
+        assert report["status"] == "breaking"
+        assert report["mode"] == "enforce"
+
+    def test_mode_flags_are_mutually_exclusive(self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        argv = [sys.executable, str(CLI), "manifest-check",
+                "--repo", str(repo.root), "--manifest-set", ".rhoai/manifests.yaml",
+                "--baseline-ref", baseline, "--output-dir", str(outputs / "r1"),
+                "--enforce", "--report-only"]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=ENV)
+        assert result.returncode == 2
+        assert "not allowed with" in result.stderr
+        assert not (outputs / "r1" / "report.json").exists()
 
     def test_warning_only_never_breaks(self, repo: Repo, outputs: Path) -> None:
         repo.write("manifests/cm.yaml", CONFIGMAP)
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/cm.yaml", "# removed\n")
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         finding = finding_for(report, "resource-removed")
@@ -425,7 +453,7 @@ class TestCheckStatusMatrix:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)  # uncommitted
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         assert finding_ids(report) == ["storageclass-provisioner-immutable"]
 
@@ -440,7 +468,7 @@ class TestBaselines:
         repo.descriptor([repo.raw_scenario()])
         first = repo.commit("first")
         second = repo.commit("second")
-        result, report = repo.check([first, second], outputs / "r1", enforce=True)
+        result, report = repo.check([first, second], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert [b["status"] for b in report["baselines"]] == ["compared", "compared"]
         assert [b["compatible"] for b in report["baselines"]] == [True, True]
@@ -452,7 +480,7 @@ class TestBaselines:
         first = repo.commit("original")
         repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
         second = repo.commit("changed")
-        result, report = repo.check([first, second], outputs / "r1", enforce=True)
+        result, report = repo.check([first, second], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         assert report["status"] == "breaking"
         assert report["baselines"][0]["compatible"] is False
@@ -466,7 +494,7 @@ class TestBaselines:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         missing = "0" * 40
-        result, report = repo.check([baseline, missing], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline, missing], outputs / "r1", mode="enforce")
         assert result.returncode == 2
         assert report["status"] == "error"
         assert report["baselines"][0]["status"] == "compared"
@@ -526,7 +554,9 @@ class TestBaselines:
                          repo.raw_scenario("config", ["manifests/cm.yaml"])])
         baseline = repo.commit()
         repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
-        result, report = repo.check([baseline], outputs / "r1", scenario_id="storage")
+        result, report = repo.check(
+            [baseline], outputs / "r1", scenario_id="storage", mode="report-only",
+        )
         assert result.returncode == 0
         assert set(report["candidate"]["scenarios"]) == {"storage"}
         assert finding_ids(report) == ["storageclass-provisioner-immutable"]
@@ -588,7 +618,7 @@ class TestNewDeclarations:
         descriptor_text = (repo.root / ".rhoai/manifests.yaml").read_text(encoding="utf-8")
         repo.write(".rhoai/manifests.yaml", descriptor_text.replace("PENDING", baseline))
         repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         entry = report["baselines"][0]["scenarios"]["app"]
         assert entry["status"] == "new"
@@ -718,7 +748,7 @@ class TestCandidateStates:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/cm.yaml", "# everything removed\n")
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert report["candidate"]["scenarios"]["app"]["object_count"] == 0
         assert report["candidate"]["scenarios"]["app"]["status"] == "ready"
@@ -734,8 +764,8 @@ class TestCandidateStates:
         }])])
         baseline = repo.commit()
         repo.write("manifests/cm.yaml", "# everything removed\n")
-        enforce_result, enforce_report = repo.check([baseline], outputs / "enforce", enforce=True)
-        report_result, report_only = repo.check([baseline], outputs / "report")
+        enforce_result, enforce_report = repo.check([baseline], outputs / "enforce", mode="enforce")
+        report_result, report_only = repo.check([baseline], outputs / "report", mode="report-only")
         assert enforce_result.returncode == 1
         assert report_result.returncode == 0
         finding = finding_for(enforce_report, "protected-resource-removed")
@@ -770,7 +800,7 @@ class TestExceptions:
             "baselineRef": baseline,
             "reason": "coordinated migration",
         }])])
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         finding = finding_for(report, "storageclass-provisioner-immutable")
@@ -801,7 +831,7 @@ class TestExceptions:
         descriptor_text = (repo.root / ".rhoai/manifests.yaml").read_text(encoding="utf-8")
         repo.write(".rhoai/manifests.yaml", descriptor_text.replace("PENDING", baseline))
         repo.write("manifests/cm.yaml", "# everything removed\n")
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         finding = finding_for(report, "protected-resource-removed")
@@ -821,7 +851,7 @@ class TestExceptions:
             "baselineRef": baseline,
             "reason": "targets nothing",
         }])])
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         finding = finding_for(report, "storageclass-provisioner-immutable")
         assert not finding.get("suppressed")
@@ -839,7 +869,7 @@ class TestExceptions:
             "baselineRef": baseline,
             "reason": "describes an older change",
         }])])
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         assert set(finding_ids(report)) == {
             "storageclass-provisioner-immutable", "stale-exception"}
@@ -889,7 +919,7 @@ class TestExceptions:
         baseline = repo.commit()
         repo.write("manifests/web1.yaml", deployment("web1", "broken"))
         repo.write("manifests/web2.yaml", deployment("web2", "broken"))
-        first_result, first_report = repo.check([baseline], outputs / "r1", enforce=True)
+        first_result, first_report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert first_result.returncode == 1
         losses = [f for f in first_report["baselines"][0]["findings"]
                   if f["id"] == "selector-target-lost"]
@@ -907,7 +937,7 @@ class TestExceptions:
             "edgeId": waived["edge_id"],
             "reason": "intentional deselection",
         }])])
-        result, report = repo.check([baseline], outputs / "r2", enforce=True)
+        result, report = repo.check([baseline], outputs / "r2", mode="enforce")
         assert result.returncode == 1  # web2 loss remains active
         losses = [f for f in report["baselines"][0]["findings"]
                   if f["id"] == "selector-target-lost"]
@@ -956,7 +986,7 @@ class TestCandidateEdgeCorrelation:
     def test_comparison_duplicate_absorbed_into_candidate_finding(
             self, repo: Repo, outputs: Path) -> None:
         baseline = self.correlation_repo(repo)
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         findings = self.env_candidate_findings(report)
         assert len(findings) == 1
@@ -984,7 +1014,7 @@ class TestCandidateEdgeCorrelation:
     def test_reordered_env_list_keeps_association(
             self, repo: Repo, outputs: Path) -> None:
         baseline = self.correlation_repo(repo, reorder=True)
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         findings = self.env_candidate_findings(report)
         assert len(findings) == 1
@@ -1021,7 +1051,7 @@ class TestCandidateEdgeCorrelation:
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
         repo.write("manifests/cm.yaml", CONFIGMAP_KEY_DROPPED)
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         findings = self.env_candidate_findings(report)
         assert len(findings) == 2
@@ -1043,7 +1073,7 @@ class TestCandidateEdgeCorrelation:
         repo.write("manifests/note.txt", "unrelated change\n")
         second = repo.commit("unrelated")
         repo.write("manifests/cm.yaml", CONFIGMAP_KEY_DROPPED)
-        result, report = repo.check([baseline, second], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline, second], outputs / "r1", mode="enforce")
         assert result.returncode == 1
         findings = self.env_candidate_findings(report)
         assert len(findings) == 1
@@ -1058,7 +1088,7 @@ class TestCandidateEdgeCorrelation:
     def test_waiving_an_absorbed_candidate_finding_fails(
             self, repo: Repo, outputs: Path) -> None:
         baseline = self.correlation_repo(repo)
-        first_result, first_report = repo.check([baseline], outputs / "r1", enforce=True)
+        first_result, first_report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert first_result.returncode == 1
         finding = self.env_candidate_findings(first_report)[0]
         association = finding["baseline_associations"][0]
@@ -1087,7 +1117,7 @@ class TestPatchExtrapolation:
         repo.write("manifests/sc.yaml", STORAGE_CLASS)
         repo.descriptor([repo.raw_scenario(kubernetesVersion="1.37.1")])
         baseline = repo.commit()
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0  # a warning never breaks enforcement
         findings = report["candidate_findings"]
         assert [f["id"] for f in findings] == ["patch-coverage-extrapolated"]
@@ -1229,7 +1259,7 @@ class TestPrepareCommand:
         repo.write("manifests/sc.yaml", STORAGE_CLASS)
         repo.descriptor([repo.raw_scenario()])
         baseline = repo.commit()
-        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
 

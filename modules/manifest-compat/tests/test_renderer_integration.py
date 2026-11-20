@@ -181,7 +181,7 @@ class ProviderRepo:
         self.git("commit", "-q", "--allow-empty", "-m", message)
         return self.git("rev-parse", "HEAD")
 
-    def check(self, baselines: list[str], output: Path, *, enforce: bool = False,
+    def check(self, baselines: list[str], output: Path, *, mode: str = "enforce",
               scenario_id: str | None = None, cache: Path | None = None,
               manifest_set: str = ".rhoai/manifests.yaml",
               env: dict[str, str] | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
@@ -194,8 +194,7 @@ class ProviderRepo:
         argv += ["--output-dir", str(output)]
         if cache is not None:
             argv += ["--tool-cache-dir", str(cache)]
-        if enforce:
-            argv.append("--enforce")
+        argv += ["--enforce"] if mode == "enforce" else ["--report-only"]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT,
                                 env=env or ENV)
         report = json.loads((output / "report.json").read_text(encoding="utf-8"))
@@ -531,7 +530,7 @@ class TestRealRendererComparisons:
                   "image: example.com/web:1.0", "image: example.com/web:1.1")
         repo.commit("rollout")
 
-        result, report = repo.check([base], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([base], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         assert report["errors"] == []
@@ -566,7 +565,7 @@ class TestRealRendererComparisons:
         repo.edit("selftest/manifests/raw/deployment.yaml", "app: web", "app: web2")
         repo.commit("selector change")
 
-        enforced, enforce_report = repo.check([base], outputs, enforce=True)
+        enforced, enforce_report = repo.check([base], outputs, mode="enforce")
         assert enforced.returncode == 1
         assert enforce_report["status"] == "breaking"
         findings = enforce_report["baselines"][0]["findings"]
@@ -576,7 +575,9 @@ class TestRealRendererComparisons:
         assert by_id["selector-target-lost"]["resource"]["name"] == "web"
 
         # Report mode surfaces the same findings without failing the run.
-        reported, report_only = repo.check([base], outputs.parent / "report")
+        reported, report_only = repo.check(
+            [base], outputs.parent / "report", mode="report-only",
+        )
         assert reported.returncode == 0
         assert report_only["status"] == "breaking"
         assert {finding["id"] for finding in report_only["baselines"][0]["findings"]} == \
@@ -593,7 +594,7 @@ class TestRealRendererComparisons:
                   "    metadata:\n      labels: {}\n")
         repo.commit("label loss")
 
-        result, report = repo.check([base], outputs, enforce=True)
+        result, report = repo.check([base], outputs, mode="enforce")
         assert result.returncode == 1
         assert report["status"] == "breaking"
         # The mismatch exists in the candidate alone: it is validated on the
@@ -617,7 +618,7 @@ class TestRealRendererComparisons:
         repo.commit("shrink")
 
         # Warnings alone stay compatible, even in enforce mode.
-        result, report = repo.check([base], outputs, enforce=True)
+        result, report = repo.check([base], outputs, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         findings = report["baselines"][0]["findings"]
@@ -635,7 +636,7 @@ class TestRealRendererComparisons:
         repo.write("manifests/jobs/migrate.yaml", JOB_SCHEDULING.format(parallelism="2"))
         repo.commit("reschedule")
 
-        result, report = repo.check([base], outputs, enforce=True)
+        result, report = repo.check([base], outputs, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         findings = report["baselines"][0]["findings"]
@@ -653,7 +654,7 @@ class TestRealRendererComparisons:
                   "alpha=one", "alpha=two")
         repo.commit("rotate generated config")
 
-        result, report = repo.check([base], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([base], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         findings = report["baselines"][0]["findings"]
@@ -681,7 +682,7 @@ class TestRealRendererComparisons:
         repo.descriptor(scenarios)
         repo.commit("move kustomization")
 
-        result, report = repo.check([base], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([base], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         baseline = report["baselines"][0]
@@ -702,7 +703,7 @@ class TestRealRendererComparisons:
 
         # A successful zero-object render is a valid candidate: every baseline
         # object was removed, which is a warning for unprotected resources.
-        result, report = repo.check([base], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([base], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         assert report["candidate"]["scenarios"]["kustomize-app"]["object_count"] == 0
@@ -719,7 +720,7 @@ class TestRealRendererComparisons:
         }]
         repo.descriptor(scenarios)
         protected, protected_report = repo.check(
-            [base], outputs.parent / "protected", cache=tool_cache, enforce=True)
+            [base], outputs.parent / "protected", cache=tool_cache, mode="enforce")
         assert protected.returncode == 1
         assert protected_report["status"] == "breaking"
         findings = protected_report["baselines"][0]["findings"]
@@ -760,7 +761,7 @@ class TestRealRendererComparisons:
                   "    metadata:\n      labels:\n        app: orphaned\n")
         repo.commit("orphan template label")
 
-        result, report = repo.check([base], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([base], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 1
         assert report["status"] == "breaking"
         baseline = report["baselines"][0]
@@ -813,7 +814,7 @@ class TestBootstrapDeclarations:
         repo.descriptor(scenarios)
         repo.commit("introduce fixtures")
 
-        result, report = repo.check([pre], outputs, enforce=True)
+        result, report = repo.check([pre], outputs, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "new"
         baseline = report["baselines"][0]
@@ -926,7 +927,7 @@ class TestBootstrapDeclarations:
                   "image: example.com/web:1.0", "image: example.com/web:1.1")
         later = repo.commit("rollout")
 
-        result, report = repo.check([later], outputs, cache=tool_cache, enforce=True)
+        result, report = repo.check([later], outputs, cache=tool_cache, mode="enforce")
         assert result.returncode == 0
         assert report["status"] == "compatible"
         baseline = report["baselines"][0]

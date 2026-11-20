@@ -219,8 +219,9 @@ def check_args(check: str, env: Mapping[str, str], workspace: Path) -> list[str]
         cache = _tool_cache_dir(env, workspace, required=False)
         if cache is not None:
             args += ["--tool-cache-dir", str(cache)]
-        # Rendering is strictly offline; the cache was prepared by `prepare manifest`.
-        return args + (["--enforce"] if mode == "enforce" else [])
+        # Rendering is offline by process-level controls (see renderers.py);
+        # the cache was prepared by `prepare manifest`.
+        return args + (["--enforce"] if mode == "enforce" else ["--report-only"])
     raise InputError(f"unknown check {check!r}")
 
 

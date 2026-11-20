@@ -13,10 +13,10 @@ on:
         required: false
         type: string
       mode:
-        description: report or enforce
+        description: enforce (default, breaking changes fail) or report (record only)
         required: false
         type: string
-        default: report
+        default: enforce
       baseline-refs:
         description: Space-separated full Git SHAs
         required: true

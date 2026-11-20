@@ -289,8 +289,20 @@ def test_manifest_args_default_to_the_standard_manifest_set():
     assert steps.check_args("manifest", env, WORKSPACE) == [
         "manifest-check", "--repo", "/work/provider", "--manifest-set", ".rhoai/manifests.yaml",
         "--baseline-ref", SHA, "--baseline-ref", OTHER,
-        "--output-dir", "/work/provider/.contract-report",
+        "--output-dir", "/work/provider/.contract-report", "--report-only",
     ]
+
+
+@pytest.mark.parametrize("mode", [None, ""])
+def test_manifest_mode_defaults_to_enforce(mode):
+    # A missing or empty wrapper MODE resolves to enforce, and report mode is
+    # requested through the explicit opt-out flag, matching the other checks.
+    env = {"BASELINE_REFS": SHA}
+    if mode is not None:
+        env["MODE"] = mode
+    args = steps.check_args("manifest", env, WORKSPACE)
+    assert args[-1] == "--enforce"
+    assert "--report-only" not in args
 
 
 def test_manifest_args_pass_explicit_inputs_and_enforce():
