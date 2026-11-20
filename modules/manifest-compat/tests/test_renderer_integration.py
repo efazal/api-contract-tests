@@ -513,6 +513,82 @@ env: extra.env
             server.server_close()
         assert hits == [], "the renderer must not issue any network request"
 
+    def test_case_folded_field_spellings_make_no_http_request(
+        self, repo: ProviderRepo, outputs: Path, tool_cache: Path
+    ) -> None:
+        """The pinned kustomize decodes YAML keys case-insensitively
+        (sigs.k8s.io/yaml runs the stdlib JSON decoder), so ``Path:`` in a
+        plugin configuration and ``Resources:`` in a kustomization populate
+        the real fields while case-sensitive validation would never see
+        them. Both spellings are rejected before any subprocess runs,
+        proven with a bounded local listener that would record any request
+        the render tried to make."""
+        hits: list[str] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # pragma: no cover - must not happen
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"apiVersion: v1\nkind: ConfigMap\n")
+
+            def do_POST(self) -> None:  # pragma: no cover - must not happen
+                hits.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True,
+        )
+        thread.start()
+        try:
+            # A valid local baseline; the candidate then respells the
+            # reference-bearing fields with capital first letters.
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "resources:\n  - deployment.yaml\n")
+            repo.write("manifests/overlays/prod/deployment.yaml",
+                       "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cfg\n")
+            repo.descriptor([kustomize_scenario("nested", "manifests/overlays/prod")])
+            base = repo.commit("valid baseline")
+
+            # Case-variant plugin field: "Path" would decode into the
+            # PatchTransformer's path field and be fetched by the loader.
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "transformers:\n  - transformers.yaml\n")
+            repo.write(
+                "manifests/overlays/prod/transformers.yaml",
+                "apiVersion: builtin\nkind: PatchTransformer\nmetadata:\n  name: patch\n"
+                f"Path: http://127.0.0.1:{port}/patch.yaml\n",
+            )
+            repo.commit("case-variant plugin field")
+            result, report = repo.check([base], outputs, cache=tool_cache)
+            assert result.returncode == 2
+            assert report["status"] == "error"
+            assert "must be spelled 'path'" in joined_errors(report)
+
+            # Case-variant kustomization field: "Resources" would decode
+            # into the resources list and be fetched by the loader.
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                       "kind: Kustomization\n"
+                       f"Resources:\n  - http://127.0.0.1:{port}/remote-base\n")
+            repo.commit("case-variant kustomization field")
+            result, report = repo.check([base], outputs.parent / "reports-2",
+                                        cache=tool_cache)
+            assert result.returncode == 2
+            assert report["status"] == "error"
+            assert "must be spelled 'resources'" in joined_errors(report)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+        assert hits == [], "the renderer must not issue any network request"
+
 
 # ---------------------------------------------------------------------------
 # Real rendering: compatible changes, breaks, and conditional warnings

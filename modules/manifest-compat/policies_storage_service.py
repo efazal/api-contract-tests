@@ -470,10 +470,13 @@ def _pvc_residual_spec(spec: dict[str, Any]) -> dict[str, Any]:
     Drops every field masked by a specific rule or audited transition (see
     ``_PVC_RESIDUAL_MASKED_SPEC_FIELDS``) and the ``storage`` request key
     (the storage-resize risk rule owns it, since bound-claim status is
-    unknowable from rendered YAML). Empty containers left by the masking
-    are pruned so an emptied ``requests``/``resources`` compares equal to
-    an omitted one, matching Go zero-value decoding. The caller's
-    dictionary is never mutated.
+    unknowable from rendered YAML). ``resources.limits`` values are
+    canonicalized to exact numeric quantities: Kubernetes compares them
+    numerically (apiequality.Semantic), so ``10Gi`` and ``10240Mi`` are the
+    same limit and must not raise the residual rule. Empty containers left
+    by the masking are pruned so an emptied ``requests``/``resources``
+    compares equal to an omitted one, matching Go zero-value decoding. The
+    caller's dictionary is never mutated.
     """
     residual = {
         key: value for key, value in spec.items()
@@ -491,6 +494,18 @@ def _pvc_residual_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 resources["requests"] = requests
             else:
                 resources.pop("requests", None)
+        limits = resources.get("limits")
+        if isinstance(limits, dict):
+            canonical: dict[str, Any] = {}
+            for key, value in limits.items():
+                quantity = _quantity_of(value)
+                # Unparseable values keep their original spelling: only a
+                # provably equal quantity may compare equal.
+                canonical[key] = value if quantity is None else quantity
+            if canonical:
+                resources["limits"] = canonical
+            else:
+                resources.pop("limits", None)
         if resources:
             residual["resources"] = resources
         else:

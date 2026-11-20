@@ -159,6 +159,81 @@ _REFERENCE_FREE_PLUGIN_KINDS = frozenset({
     "ReplicaCountTransformer",
 })
 
+# The pinned kustomize decodes YAML through sigs.k8s.io/yaml, whose JSON step
+# matches Go struct field names case-insensitively (stdlib decoder semantics;
+# the pinned yaml@v1.6.0 documents this). A key spelled ``Path`` in a plugin
+# configuration or ``Resources`` in a kustomization therefore populates the
+# real field while this module's case-sensitive readers never see it —
+# silently bypassing every reference check below. Keys are validated by
+# case-fold collision: a key matching a known kustomize field name only after
+# lowercasing is rejected with its canonical spelling. Keys that match no
+# field in any casing are ignored by the pinned kustomize (non-strict decode)
+# and stay legal. Field names below were extracted from the pinned source:
+# sigs.k8s.io/kustomize/api@v0.21.3 types/kustomization.go (Kustomization
+# struct), types/{patch,replacement,replacementfield,labels,generatorargs,
+# kvpairsources,generatoroptions}.go, and internal/builtins/*.go.
+_KUSTOMIZATION_FIELDS = frozenset({
+    "kind", "apiVersion", "metadata", "openapi", "namePrefix", "nameSuffix",
+    "namespace", "commonLabels", "labels", "commonAnnotations",
+    "patchesStrategicMerge", "patchesJson6902", "patches", "images",
+    "imageTags", "replacements", "replicas", "vars", "sortOptions",
+    "resources", "components", "crds", "bases", "configMapGenerator",
+    "secretGenerator", "helmGlobals", "helmCharts",
+    "helmChartInflationGenerator", "generatorOptions", "configurations",
+    "generators", "transformers", "validators", "buildMetadata",
+})
+# Top-level fields of every builtin plugin configuration kind, plus the
+# generic apiVersion/kind/metadata envelope.
+_PLUGIN_SPEC_FIELDS = frozenset({
+    "apiVersion", "kind", "metadata", "path", "patch", "target", "options",
+    "jsonOp", "paths", "patches", "replacements", "value", "targets",
+    "targetFilePath", "name", "namespace", "behavior", "literals", "files",
+    "envs", "env", "labels", "fieldSpecs", "prefix", "suffix", "unsetOnly",
+    "setRoleBindingSubjects", "annotations", "imageTag", "replica",
+    "sortOptions",
+})
+# Struct-decoded list entries inside a kustomization: the field names of the
+# element structs (Patch, ReplacementField, Label, and the generator args).
+_KUSTOMIZATION_ENTRY_FIELDS: dict[str, frozenset[str]] = {
+    "patches": frozenset({"path", "patch", "target", "options"}),
+    "patchesJson6902": frozenset({"target", "path", "jsonOp"}),
+    "replacements": frozenset({"source", "targets", "sourceValue", "path"}),
+    "labels": frozenset({
+        "pairs", "includeSelectors", "includeTemplates",
+        "includeVolumeClaimTemplates", "fields",
+    }),
+    "configMapGenerator": frozenset({
+        "name", "namespace", "behavior", "literals", "files", "envs", "env",
+        "options",
+    }),
+    "secretGenerator": frozenset({
+        "name", "namespace", "behavior", "literals", "files", "envs", "env",
+        "options", "type", "format",
+    }),
+}
+
+
+def _reject_case_folded_keys(mapping: Mapping[str, Any],
+                             field_names: frozenset[str], where: str) -> None:
+    """Reject keys that match kustomize struct fields only case-insensitively.
+
+    Complements the case-sensitive readers: any key the pinned kustomize
+    would decode into a struct field must carry that field's exact canonical
+    spelling, or the reference validation reading the lowercase name would
+    never see it.
+    """
+    lowered = {name.lower(): name for name in field_names}
+    for key in mapping:
+        if not isinstance(key, str):
+            continue
+        canonical = lowered.get(key.lower())
+        if canonical is not None and key != canonical:
+            raise RenderError(
+                f"{where}: field {key!r} must be spelled {canonical!r}; the pinned "
+                "kustomize matches YAML keys case-insensitively, so a differently "
+                "cased spelling would bypass input validation"
+            )
+
 _GO_VERSION_RE = re.compile(r"go(\d+)\.(\d+)(?:\.(\d+))?")
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
 
@@ -1379,6 +1454,38 @@ def _validate_repo_relative(value: Any, what: str, *, allow_glob: bool = False) 
     return normalized
 
 
+def _reject_hazardous_ancestors(snapshot: _Snapshot, rel: str, what: str) -> None:
+    """Fail closed when ``rel`` or any of its ancestors is a snapshot hazard.
+
+    A gitlink, symlink, or LFS pointer at an ancestor of a selected input
+    hides everything beneath it: those descendant paths match no snapshot
+    files, so the input looks wholly absent even though its real content is
+    merely uninspectable. Absence classification — and the baseline
+    authorization built on it — must never see such a path as absent; it is
+    an integrity error instead. The path itself is included, so this also
+    covers a hazard at the exact selected path.
+    """
+    parts = PurePosixPath(rel).parts
+    for depth in range(1, len(parts) + 1):
+        ancestor = "/".join(parts[:depth])
+        hazard = snapshot.hazards.get(ancestor)
+        if hazard is not None:
+            raise RenderError(
+                f"{what} {ancestor!r} cannot be safely materialized "
+                f"({hazard.get('hazard')}); its contents cannot be inspected"
+            )
+
+
+def _static_glob_prefix(pattern: str) -> str:
+    """The glob-free leading directory prefix of a source pattern."""
+    prefix: list[str] = []
+    for part in PurePosixPath(pattern).parts:
+        if _GLOB_CHARS.search(part):
+            break
+        prefix.append(part)
+    return "/".join(prefix)
+
+
 def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
     scenario_id = scenario.get("id", "<unnamed>")
     sources = scenario.get("sources")
@@ -1393,6 +1500,14 @@ def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
         pattern = _validate_repo_relative(
             pattern, f"scenario {scenario_id!r} sources entry", allow_glob=True
         )
+        # An ancestor of the pattern's static prefix that is a hazard hides
+        # every file the pattern could match: that is uninspectable content,
+        # not an absent source set.
+        prefix = _static_glob_prefix(pattern)
+        if prefix:
+            _reject_hazardous_ancestors(
+                snapshot, prefix, f"scenario {scenario_id!r} source pattern prefix",
+            )
         hazards = sorted(
             file for file in snapshot.hazards if fnmatch.fnmatchcase(file, pattern)
         )
@@ -1441,15 +1556,13 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
         scenario.get("path"), f"scenario {scenario_id!r} chart path"
     )
     chart_prefix = chart_rel.strip("/") + "/"
-    # Classify the exact chart root before its descendants: a root that is
-    # itself a gitlink, symlink, or LFS pointer is a hazard, and a root that
-    # is a regular file is a wrong-kind input — neither is an absent chart.
-    root_hazard = snapshot.hazards.get(chart_rel)
-    if root_hazard is not None:
-        raise RenderError(
-            f"scenario {scenario_id!r}: chart path {chart_rel!r} cannot be safely "
-            f"materialized ({root_hazard.get('hazard')})"
-        )
+    # Classify the chart path and every ancestor before its descendants: a
+    # gitlink, symlink, or LFS pointer at the root or any ancestor is a
+    # hazard (uninspectable content, never an authorizable absent chart),
+    # and a root that is a regular file is a wrong-kind input.
+    _reject_hazardous_ancestors(
+        snapshot, chart_rel, f"scenario {scenario_id!r} chart path",
+    )
     if chart_rel in snapshot.files:
         raise RenderError(
             f"scenario {scenario_id!r}: chart path {chart_rel!r} is a regular file, "
@@ -1470,11 +1583,9 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
     values_missing: list[str] = []
     for entry in scenario.get("valuesFiles") or []:
         rel = _validate_repo_relative(entry, f"scenario {scenario_id!r} values file")
-        if rel in snapshot.hazards:
-            raise RenderError(
-                f"scenario {scenario_id!r}: values file {rel!r} cannot be safely materialized "
-                f"({snapshot.hazards[rel].get('hazard')})"
-            )
+        _reject_hazardous_ancestors(
+            snapshot, rel, f"scenario {scenario_id!r} values file",
+        )
         if rel in snapshot.files:
             values_present.append(rel)
         else:
@@ -1740,6 +1851,7 @@ def _validate_generator_sources(entry: Mapping[str, Any], label: str,
 def _validate_plugin_spec(spec: Mapping[str, Any], source: str,
                           kust_dir: str, snapshot: _Snapshot) -> None:
     """Validate one builtin plugin configuration, rejecting unsafe forms."""
+    _reject_case_folded_keys(spec, _PLUGIN_SPEC_FIELDS, source)
     api_version = spec.get("apiVersion")
     kind = spec.get("kind")
     if isinstance(api_version, str) and isinstance(kind, str):
@@ -1793,6 +1905,10 @@ def _validate_plugin_spec(spec: Mapping[str, Any], source: str,
             for entry in value:
                 if not isinstance(entry, dict):
                     raise RenderError(f"{source}: {field} entries must be mappings")
+                _reject_case_folded_keys(
+                    entry, _KUSTOMIZATION_ENTRY_FIELDS["replacements"],
+                    f"{source}: {field} entry",
+                )
                 path = entry.get("path")
                 if path is None:
                     continue
@@ -1835,6 +1951,7 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
         raise RenderError(f"{kust_dir}: directory is not a kustomization root")
     source = f"{kust_dir}/{kust_file}"
     document = _parse_yaml_document(snapshot.read(source), source)
+    _reject_case_folded_keys(document, _KUSTOMIZATION_FIELDS, source)
     for forbidden in ("helmGlobals", "helmCharts", "helmChart"):
         if forbidden in document:
             raise RenderError(
@@ -1913,6 +2030,9 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
             if isinstance(entry, str):
                 _resolve_local_reference(entry, kust_dir, snapshot, "patches", where, require_file=True)
             elif isinstance(entry, dict):
+                _reject_case_folded_keys(
+                    entry, _KUSTOMIZATION_ENTRY_FIELDS["patches"], f"{where}: patches entry",
+                )
                 path = entry.get("path")
                 if isinstance(path, str) and path:
                     _resolve_local_reference(path, kust_dir, snapshot, "patches", where, require_file=True)
@@ -1951,6 +2071,9 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
         for entry in entries:
             if not isinstance(entry, dict):
                 raise RenderError(f"{where}: {field} entries must be mappings")
+            _reject_case_folded_keys(
+                entry, _KUSTOMIZATION_ENTRY_FIELDS[field], f"{where}: {field} entry",
+            )
             for key in keys:
                 path = entry.get(key)
                 if isinstance(path, str) and path:
@@ -1969,6 +2092,9 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
         for entry in entries:
             if not isinstance(entry, dict):
                 raise RenderError(f"{where}: {field} entries must be mappings")
+            _reject_case_folded_keys(
+                entry, _KUSTOMIZATION_ENTRY_FIELDS[field], f"{where}: {field} entry",
+            )
             _validate_generator_sources(entry, f"{where}: {field}", kust_dir, snapshot)
 
 
@@ -1979,15 +2105,13 @@ def _render_kustomize(snapshot: _Snapshot, scenario: Mapping[str, Any],
         scenario.get("path"), f"scenario {scenario_id!r} kustomize path"
     )
     kust_prefix = kust_rel.strip("/") + "/"
-    # Classify the exact overlay root before its descendants: a root that is
-    # itself a gitlink, symlink, or LFS pointer is a hazard, and a root that
-    # is a regular file is a wrong-kind input — neither is an absent overlay.
-    root_hazard = snapshot.hazards.get(kust_rel)
-    if root_hazard is not None:
-        raise RenderError(
-            f"scenario {scenario_id!r}: kustomize path {kust_rel!r} cannot be safely "
-            f"materialized ({root_hazard.get('hazard')})"
-        )
+    # Classify the overlay path and every ancestor before its descendants: a
+    # gitlink, symlink, or LFS pointer at the root or any ancestor is a
+    # hazard (uninspectable content, never an authorizable absent overlay),
+    # and a root that is a regular file is a wrong-kind input.
+    _reject_hazardous_ancestors(
+        snapshot, kust_rel, f"scenario {scenario_id!r} kustomize path",
+    )
     if kust_rel in snapshot.files:
         raise RenderError(
             f"scenario {scenario_id!r}: kustomize path {kust_rel!r} is a regular file, "

@@ -524,6 +524,24 @@ class TestPersistentVolumeClaim:
             "pvc-spec-immutable", "/spec")
 
     @pytest.mark.parametrize("version", AUDITED_VERSIONS)
+    def test_equivalent_limits_quantity_spellings_are_not_a_change(
+        self, version: str,
+    ) -> None:
+        # Kubernetes compares resource quantities numerically
+        # (apiequality.Semantic): 10Gi and 10240Mi are the same limit, so
+        # respelling a limit must not raise the residual whole-spec rule.
+        scenario = dict(SCENARIO, kubernetesVersion=version)
+        baseline = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10Gi",
+        )
+        candidate = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10240Mi",
+        )
+        assert run_compare(baseline, candidate, scenario) == []
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS)
     def test_resources_limits_removal_is_caught(self, version: str) -> None:
         scenario = dict(SCENARIO, kubernetesVersion=version)
         baseline = PVC_BASELINE.replace(

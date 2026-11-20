@@ -872,6 +872,29 @@ class TestAbsentBaselineAuthorization:
         assert "existing baselineCase override are absent" in entry["errors"][0]
         assert "cannot be bypassed" in entry["errors"][0]
 
+    def test_authorization_cannot_reclassify_uninspectable_ancestors(
+            self, repo: Repo, outputs: Path) -> None:
+        # A gitlink at an ancestor of the scenario sources hides the real
+        # historical content: the inputs are not absent, they are
+        # uninspectable, and the opt-in must not turn that into a new
+        # baseline.
+        repo.write("unrelated.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(sources=["manifests/added.yaml"])])
+        head = repo.commit()
+        repo.git("update-index", "--add", "--cacheinfo", f"160000,{head},manifests")
+        repo.git("commit", "-q", "--allow-empty", "-m", "gitlink ancestor")
+        baseline = repo.git("rev-parse", "HEAD")
+        # The candidate pull request replaces the uninspectable gitlink with
+        # real files: drop the index entry so the candidate working tree is
+        # a normal directory.
+        repo.git("rm", "-q", "--cached", "manifests")
+        repo.write("manifests/added.yaml", CONFIGMAP_ADDED)
+        result, report = repo.check([baseline], outputs / "r1", allow_missing=[baseline])
+        assert result.returncode == 2
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "error"
+        assert "cannot be inspected" in entry["errors"][0]
+
     def test_mixed_strict_authorized_and_compared_baselines(
             self, repo: Repo, outputs: Path) -> None:
         # Strict (undeclared absent), authorized (wholly absent), and compared

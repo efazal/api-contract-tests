@@ -1311,6 +1311,19 @@ class TestHelmRender:
         with pytest.raises(RenderError, match="cannot be safely materialized"):
             renderers.render(records, helm_scenario(), prepared_cache(tmp_path, "helm"))
 
+    def test_hazardous_chart_ancestor_is_not_an_absent_chart(
+        self, tmp_path: Path,
+    ) -> None:
+        # A gitlink at an ANCESTOR of the chart path hides everything below
+        # it: the chart looks wholly absent while its real content is merely
+        # uninspectable, so absence classification (and the baseline
+        # authorization built on it) must never see it as absent.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        commit_extra_file(repo, "charts", "", mode="160000", working_copy=False)
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be inspected"):
+            renderers.render(records, helm_scenario(), prepared_cache(tmp_path, "helm"))
+
     def test_chart_root_regular_file_is_malformed(self, tmp_path: Path) -> None:
         # A regular file where the chart directory is required is a wrong-kind
         # input, not an absent chart.
@@ -1661,6 +1674,19 @@ class TestKustomizeRender:
         with pytest.raises(RenderError, match="is a regular file, not a kustomization directory"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
 
+    def test_hazardous_overlay_ancestor_is_not_an_absent_path(
+        self, tmp_path: Path,
+    ) -> None:
+        # A gitlink at an ANCESTOR of the overlay path hides everything
+        # below it: the overlay looks wholly absent while its real content
+        # is merely uninspectable, which absence classification must never
+        # treat as an absent (authorizable) source set.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        commit_extra_file(repo, "manifests", "", mode="160000", working_copy=False)
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be inspected"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
     def test_directory_without_kustomization_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"manifests/overlays/prod/deployment.yaml": "kind: Deployment\n"})
         records, _ = snap_candidate(repo, tmp_path)
@@ -1952,6 +1978,78 @@ class TestKustomizeRender:
         records, _ = snap_candidate(repo, tmp_path)
         with pytest.raises(RenderError, match="remote reference"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_plugin_field_casing_is_rejected(self, tmp_path: Path) -> None:
+        # The pinned kustomize decodes YAML keys case-insensitively
+        # (sigs.k8s.io/yaml runs the stdlib JSON decoder), so a key spelled
+        # "Path" populates the real field while case-sensitive validation
+        # never sees it — the loader would fetch the URL. Noncanonical
+        # spellings of known fields are rejected with the canonical name.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "transformers:\n  - transformers.yaml\n",
+            "manifests/overlays/prod/transformers.yaml":
+                "apiVersion: builtin\nkind: PatchTransformer\nmetadata:\n"
+                "  name: patch\nPath: https://example.invalid/patch.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="must be spelled 'path'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_kustomization_field_casing_is_rejected(self, tmp_path: Path) -> None:
+        # Same bypass at the kustomization top level: "Resources" decodes
+        # into the resources field and is fetched through the loader.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                "kind: Kustomization\n"
+                "Resources:\n  - https://example.invalid/base\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="must be spelled 'resources'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_kustomization_entry_field_casing_is_rejected(self, tmp_path: Path) -> None:
+        # Struct-decoded list entries (generators, replacements) carry file
+        # references too; their fields are held to the same canonical
+        # spelling.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "configMapGenerator:\n  - name: cfg\n    Files: [a.yaml]\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="must be spelled 'files'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+        repo = build_repo(tmp_path, name="repo-repl", files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "replacements:\n  - Path: replacements.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path, name="snap-repl")
+        with pytest.raises(RenderError, match="must be spelled 'path'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_canonical_camel_case_fields_still_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Canonical camelCase names are exact matches, never fold
+        # collisions: patchesStrategicMerge and label pairs validate
+        # normally and reach the renderer.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                "kind: Kustomization\n"
+                "patchesStrategicMerge:\n  - patch.yaml\n"
+                "labels:\n  - pairs:\n      app: demo\n"
+            ),
+            "manifests/overlays/prod/patch.yaml":
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cm\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
 
     def test_nested_plugin_second_document_validated(self, tmp_path: Path) -> None:
         # Every document in a multi-document configuration stream is
@@ -2260,6 +2358,16 @@ class TestRawRender:
         records, _ = snap_candidate(repo, tmp_path)
         with pytest.raises(RenderError, match="cannot be safely materialized"):
             renderers.render(records, raw_scenario(["link.yaml"]), None)
+
+    def test_hazardous_glob_ancestor_is_not_an_absent_source(self, tmp_path: Path) -> None:
+        # A gitlink at an ancestor directory of a source pattern hides every
+        # file the pattern could match: that is uninspectable content, not a
+        # wholly absent (authorizable) source set.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        commit_extra_file(repo, "manifests", "", mode="160000", working_copy=False)
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be inspected"):
+            renderers.render(records, raw_scenario(["manifests/*.yaml"]), None)
 
     def test_escaped_sources_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"a.yaml": "kind: A\n"})
