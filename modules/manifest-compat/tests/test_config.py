@@ -149,10 +149,18 @@ def full_optional_document() -> dict[str, Any]:
     return document
 
 
+def _mutated(base: dict[str, Any], mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    document = copy.deepcopy(base)
+    mutate(document)
+    return document
+
+
 VALID_CORPUS: list[tuple[str, dict[str, Any]]] = [
     ("minimal raw", raw_document()),
     ("raw with all optional fields", full_optional_document()),
     ("helm full", helm_document()),
+    ("helm dotted maximal releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update(
+        {"releaseName": "a" * 26 + "." + "b" * 26}))),
     ("kustomize with new baseline case", kustomize_document()),
     ("raw and helm scenarios", {
         "apiVersion": "contracts.rhoai.io/v1alpha1",
@@ -193,12 +201,6 @@ VALID_CORPUS: list[tuple[str, dict[str, Any]]] = [
 ]
 
 
-def _mutated(base: dict[str, Any], mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
-    document = copy.deepcopy(base)
-    mutate(document)
-    return document
-
-
 INVALID_CORPUS: list[tuple[str, dict[str, Any]]] = [
     ("unknown root property", _mutated(raw_document(), lambda d: d.update({"extra": 1}))),
     ("wrong apiVersion", _mutated(raw_document(), lambda d: d.update({"apiVersion": "v2"}))),
@@ -228,6 +230,22 @@ INVALID_CORPUS: list[tuple[str, dict[str, Any]]] = [
     ("raw declares releaseMode", _mutated(raw_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseMode": "install"}))),
     ("helm without path", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].pop("path"))),
     ("helm without releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].pop("releaseName"))),
+    ("helm empty releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": ""}))),
+    ("helm set-file injection releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update(
+        {"releaseName": "--set-file=x=/etc/hosts"}))),
+    ("helm values injection releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update(
+        {"releaseName": "--values=/etc/hosts"}))),
+    ("helm output-dir injection releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update(
+        {"releaseName": "--output-dir=/tmp/leak"}))),
+    ("helm repo injection releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update(
+        {"releaseName": "--repo=https://charts.example.invalid"}))),
+    ("helm uppercase releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "Demo"}))),
+    ("helm whitespace releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "de mo"}))),
+    ("helm newline releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "de\nmo"}))),
+    ("helm leading hyphen releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "-demo"}))),
+    ("helm trailing hyphen releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "demo-"}))),
+    ("helm leading dot releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": ".demo"}))),
+    ("helm overlong releaseName", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseName": "a" * 54}))),
     ("helm declares sources", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"sources": ["m/*.yaml"]}))),
     ("helm invalid releaseMode", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"releaseMode": "rollback"}))),
     ("helm setValues non-string value", _mutated(helm_document(), lambda d: d["spec"]["scenarios"][0].update({"setValues": {"replicas": 3}}))),

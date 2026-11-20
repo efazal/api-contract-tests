@@ -106,6 +106,18 @@ _SHA_PATTERN = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 FORBIDDEN_TEMPLATE_FUNCTIONS = ("lookup", "tpl")
 _TEMPLATE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# --- Helm release-name rules --------------------------------------------------
+
+# Mirrors helm.sh/helm/v4@v4.3.1 pkg/chart/v2/util/validate_name.go
+# (validName / ValidateReleaseName): a full-match lowercase DNS-subdomain-style
+# name of at most 53 characters. A release name is descriptor-controlled and
+# becomes a positional argument, so it must never be able to parse as a Helm
+# option (--set-file, --values, --output-dir, repository/version flags, ...).
+HELM_RELEASE_NAME_MAX_LENGTH = 53
+_HELM_RELEASE_NAME_RE = re.compile(
+    r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*"
+)
+
 # --- Kustomize rules ----------------------------------------------------------
 
 _KUSTOMIZATION_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
@@ -1392,8 +1404,16 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
     _scan_chart_tree(_RecordTree(snapshot, chart_prefix), chart_rel, 0)
 
     release_name = scenario.get("releaseName")
-    if not isinstance(release_name, str) or not release_name:
-        raise RenderError(f"scenario {scenario_id!r}: helm scenarios require releaseName")
+    if (
+        not isinstance(release_name, str)
+        or len(release_name) > HELM_RELEASE_NAME_MAX_LENGTH
+        or _HELM_RELEASE_NAME_RE.fullmatch(release_name) is None
+    ):
+        raise RenderError(
+            f"scenario {scenario_id!r}: releaseName must be a Helm release name "
+            f"(lowercase alphanumerics, '-' and '.', starting and ending with an "
+            f"alphanumeric, at most {HELM_RELEASE_NAME_MAX_LENGTH} characters)"
+        )
     namespace = scenario.get("namespace")
     kubernetes_version = scenario.get("kubernetesVersion")
     if not isinstance(namespace, str) or not namespace:
@@ -1434,8 +1454,11 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
     if snapshot.root is None:
         raise RenderError(f"scenario {scenario_id!r}: snapshot has no root")
     chart_dir = Path(snapshot.root) / chart_rel
+    # Every supported option precedes the "--" terminator; the release name and
+    # chart path are positionals after it, so a release name can never be
+    # re-parsed as a flag even if some future validation gap let one through.
     argv: list[str] = [
-        "go", "run", HELM_PIN, "template", release_name, str(chart_dir),
+        "go", "run", HELM_PIN, "template",
         "--dry-run=client",
         "--namespace", namespace,
         "--kube-version", kubernetes_version,
@@ -1450,6 +1473,7 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
         argv.extend(["--set-string", f"{key}={set_values[key]}"])
     if release_mode == "upgrade":
         argv.append("--is-upgrade")
+    argv.extend(["--", release_name, str(chart_dir)])
     return _render_with_go(
         "helm", argv, scenario, cache_dir, f"chart {chart_rel!r}", secrets,
         private_roots=() if snapshot.root is None else (str(snapshot.root),),

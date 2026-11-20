@@ -906,7 +906,7 @@ class TestHelmRender:
         )
         assert output == b""
         expected = [
-            "go", "run", HELM_PIN, "template", "demo", str(destination / "charts/demo"),
+            "go", "run", HELM_PIN, "template",
             "--dry-run=client",
             "--namespace", "rhoai",
             "--kube-version", "1.36.6",
@@ -919,6 +919,7 @@ class TestHelmRender:
             "--set-string", "image.tag=stable",
             "--set-string", "replicas=2",
             "--is-upgrade",
+            "--", "demo", str(destination / "charts/demo"),
         ]
         assert [call["argv"] for call in runner.render_calls] == [expected, expected]
         assert len(runner.calls) == 3  # go version + two passes
@@ -934,7 +935,67 @@ class TestHelmRender:
         )
         argv = runner.render_calls[0]["argv"]
         assert "--is-upgrade" not in argv
-        assert argv[:5] == ["go", "run", HELM_PIN, "template", "demo"]
+        assert argv[:5] == ["go", "run", HELM_PIN, "template", "--dry-run=client"]
+        # Option parsing terminates before the positional release name and
+        # chart path, so every flag stays an option and neither positional can
+        # be re-parsed as one.
+        terminator = argv.index("--")
+        assert argv[terminator + 1:] == ["demo", str(destination / "charts/demo")]
+        assert argv.index("--dry-run=client") < terminator
+
+    @pytest.mark.parametrize("release_name", [
+        "--set-file=x=/etc/hosts",
+        "--values=/etc/hosts",
+        "--output-dir=/tmp/leak",
+        "--repo=https://charts.example.invalid",
+        "--version=4.3.1",
+        "--kube-version=1.36.6",
+        "Demo",
+        "de mo",
+        "de\nmo",
+        "-demo",
+        "demo-",
+        ".demo",
+        "demo.",
+        "a" * 54,
+        "",
+    ])
+    def test_invalid_release_names_rejected_before_renderer_executes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_name: str,
+    ) -> None:
+        repo = build_repo(tmp_path, copies={"chart": "charts/demo"})
+        records, _ = snap_candidate(repo, tmp_path)
+        runner = FakeRunner()
+        monkeypatch.setattr(renderers, "_run", runner)
+        # Direct render() calls bypass descriptor config loading, so the
+        # renderer entry point must reject the name itself; no renderer or
+        # toolchain subprocess may run.
+        with pytest.raises(RenderError, match="releaseName"):
+            renderers.render(
+                records, helm_scenario(releaseName=release_name),
+                prepared_cache(tmp_path, "helm"),
+            )
+        assert runner.calls == []
+
+    def test_valid_release_names_render(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = build_repo(tmp_path, copies={"chart": "charts/demo"})
+        records, destination = snap_candidate(repo, tmp_path)
+        # Dotted names are Helm release names, and 53 characters is the exact
+        # documented maximum.
+        dotted = "release.name.example"
+        maximal = "a" * 26 + "." + "b" * 26
+        assert len(maximal) == 53
+        for release_name in (dotted, maximal):
+            output, runner = run_render(
+                monkeypatch, records, helm_scenario(releaseName=release_name),
+                prepared_cache(tmp_path, "helm"),
+            )
+            assert output == b""
+            argv = runner.render_calls[0]["argv"]
+            assert argv[argv.index("--") + 1] == release_name
+            assert argv[-1] == str(destination / "charts/demo")
 
     def test_offline_isolated_environment(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

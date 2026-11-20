@@ -31,6 +31,13 @@ SEMVER_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 DNS_LABEL_PATTERN = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
 POINTER_PATTERN = re.compile(r"(?:/(?:[^/~]|~[01])*)*")
 EDGE_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+# Mirrors helm.sh/helm/v4@v4.3.1 pkg/chart/v2/util/validate_name.go
+# (validName / ValidateReleaseName); must stay identical to the renderer-side
+# check in renderers.py and to schemas/manifest-set.schema.json.
+HELM_RELEASE_NAME_MAX_LENGTH = 53
+HELM_RELEASE_NAME_PATTERN = re.compile(
+    r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*"
+)
 
 SCENARIO_KEYS = (
     "id", "renderer", "namespace", "kubernetesVersion", "apiVersions",
@@ -259,8 +266,17 @@ def _check_scenario(scenario: Any, where: str) -> None:
         if not _nonempty_str(scenario.get("path")):
             raise ConfigError(f"{where} with renderer {renderer!r} requires path")
     if renderer == "helm":
-        if not _nonempty_str(scenario.get("releaseName")):
-            raise ConfigError(f"{where} with renderer 'helm' requires releaseName")
+        release_name = scenario.get("releaseName")
+        if (
+            not isinstance(release_name, str)
+            or len(release_name) > HELM_RELEASE_NAME_MAX_LENGTH
+            or HELM_RELEASE_NAME_PATTERN.fullmatch(release_name) is None
+        ):
+            raise ConfigError(
+                f"{where}.releaseName must be a Helm release name (lowercase "
+                f"alphanumerics, '-' and '.', starting and ending with an "
+                f"alphanumeric, at most {HELM_RELEASE_NAME_MAX_LENGTH} characters)"
+            )
     else:
         for key in ("releaseName", "valuesFiles", "setValues", "releaseMode"):
             if key in scenario:

@@ -181,7 +181,13 @@
         },
         "sources": { "$ref": "#/$defs/rawSources" },
         "path": { "type": "string", "minLength": 1 },
-        "releaseName": { "type": "string", "minLength": 1 },
+        "releaseName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 53,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+          "description": "Helm release name; lowercase alphanumerics, '-' and '.', starting and ending with an alphanumeric, at most 53 characters (mirrors Helm's ValidateReleaseName)."
+        },
         "valuesFiles": { "$ref": "#/$defs/valuesFiles" },
         "setValues": { "$ref": "#/$defs/setValues" },
         "releaseMode": { "enum": ["upgrade", "install"] },
