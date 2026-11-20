@@ -45,9 +45,15 @@ Deliberate boundaries, documented per the standing rules:
   evaluates only the normal full-object update path, which rejects them.
 - CronJob jobTemplate changes affect future Jobs only and are never
   compared under Job-template immutability.
-- Empty-list/empty-map versus omission equivalence is only applied where
-  the modelled defaults establish it; JSON null is always treated as
-  omission, matching Go zero-value decoding.
+- Typed zero-value equality follows the pinned API types wherever the
+  audited validators compare decoded objects with apiequality.Semantic:
+  JSON null equals omission everywhere, a nil slice equals an empty list
+  (every collection field of the audited workload specs is a non-pointer
+  slice), and the audited non-pointer spec strings (StatefulSet
+  serviceName) equal their "" zero value. A present empty mapping is
+  never equated with omission (it decodes to a non-nil struct or
+  pointer), pointer-typed scalars keep "" distinct from absence, and
+  booleans never equal numbers.
 """
 
 from __future__ import annotations
@@ -84,6 +90,16 @@ STATEFULSET_IMMUTABLE_RULES: dict[str, str] = {
     "serviceName": "statefulset-service-name-immutable",
     "podManagementPolicy": "statefulset-pod-management-policy-immutable",
     "volumeClaimTemplates": "statefulset-volume-claim-templates-immutable",
+}
+
+# Spec fields whose pinned Go type is a plain (non-pointer) string. An
+# omitted field and an explicit "" both decode to the same Go zero value,
+# so the empty string is dropped before immutable-field comparison. Audited
+# against the pinned apps/v1 types: StatefulSetSpec.ServiceName is the only
+# such field across the audited workload specs (Deployment, DaemonSet,
+# ReplicaSet, Job, and Pod specs carry no non-pointer spec-level strings).
+_STRING_ZERO_SPEC_FIELDS: dict[tuple[str, str], frozenset[str]] = {
+    ("apps", "StatefulSet"): frozenset({"serviceName"}),
 }
 
 JOB_FIXED_FIELD_RULES: dict[str, str] = {
@@ -141,9 +157,71 @@ def _structural_equal(left: Any, right: Any) -> bool:
     return left == right
 
 
-def _changed_keys(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+def _semantic_equal(left: Any, right: Any) -> bool:
+    """Typed API equality for immutable-field comparisons.
+
+    Mirrors ``apiequality.Semantic.DeepEqual`` over JSON-decoded documents
+    for the distinctions that matter to the audited update validators. On
+    top of ``_structural_equal``: an omitted or nulled key decodes to the
+    Go zero value, and Semantic treats a nil slice as equal to an empty
+    one, so omission, JSON null, and ``[]`` compare equal for
+    slice-typed fields (all collection fields of the audited workload
+    specs are non-pointer slices).
+
+    Deliberately narrower than Semantic in two places, because JSON cannot
+    carry Go type information:
+
+    - An empty object ``{}`` is never equated with omission: a present
+      mapping decodes to a non-nil struct or pointer, which Semantic keeps
+      distinct from nil, so pointer-valued fields (Job successPolicy,
+      podFailurePolicy, Pod template affinity) preserve the difference.
+    - Scalar zero values (``""``, ``0``, ``false``) are never equated with
+      omission here: whether the zero scalar is the Go zero value or an
+      explicit dereferenced pointer is a per-field type fact, applied only
+      by ``_STRING_ZERO_SPEC_FIELDS`` call sites audited against the
+      pinned types.
+
+    ``{}`` and ``[]`` are never equal to each other, and booleans never
+    compare equal to numbers.
+    """
+    if left is None or right is None:
+        if left is None and right is None:
+            return True
+        other = right if left is None else left
+        return isinstance(other, list) and not other
+    if isinstance(left, dict) and isinstance(right, dict):
+        keys = set(left) | set(right)
+        return all(_semantic_equal(left.get(key), right.get(key)) for key in keys)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _semantic_equal(item, other) for item, other in zip(left, right)
+        )
+    return _structural_equal(left, right)
+
+
+def _semantic_changed_keys(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
     keys = set(old) | set(new)
-    return sorted(key for key in keys if not _structural_equal(old.get(key), new.get(key)))
+    return sorted(key for key in keys if not _semantic_equal(old.get(key), new.get(key)))
+
+
+def _drop_string_zeroes(spec: dict[str, Any], group: str, kind: str) -> dict[str, Any]:
+    """Drop audited non-pointer spec strings set to the empty string.
+
+    A spec field whose pinned Go type is a plain (non-pointer) string decodes
+    an omitted field and an explicit ``""`` to the same zero value, so the
+    empty form is erased before immutable-field comparison. Only the fields
+    audited in ``_STRING_ZERO_SPEC_FIELDS`` are touched: pointer-typed
+    strings (for example Job completionMode) keep ``""`` distinct from
+    omission, because a present pointer to ``""`` is not the nil pointer.
+    """
+    fields = _STRING_ZERO_SPEC_FIELDS.get((group, kind))
+    if not fields:
+        return spec
+    return {
+        key: value for key, value in spec.items()
+        if not (key in fields and isinstance(value, str) and not value)
+    }
+
 
 
 def _spec_of(document: dict[str, Any]) -> dict[str, Any]:
@@ -322,7 +400,7 @@ def _selector_findings(
 ) -> list[dict[str, Any]]:
     old_selector = _spec_of(old_document).get("selector")
     new_selector = _spec_of(new_document).get("selector")
-    if _structural_equal(_strip_nils(old_selector), _strip_nils(new_selector)):
+    if _semantic_equal(old_selector, new_selector):
         return []
     finding = _finding(
         rules, rule_id, "/spec/selector",
@@ -342,10 +420,14 @@ def _statefulset_findings(
     resource: dict[str, str],
     minor: str,
 ) -> list[dict[str, Any]]:
-    old_spec = _strip_nils(copy.deepcopy(_spec_of(old_document)))
-    new_spec = _strip_nils(copy.deepcopy(_spec_of(new_document)))
+    old_spec = _drop_string_zeroes(
+        _strip_nils(copy.deepcopy(_spec_of(old_document))), "apps", "StatefulSet"
+    )
+    new_spec = _drop_string_zeroes(
+        _strip_nils(copy.deepcopy(_spec_of(new_document))), "apps", "StatefulSet"
+    )
     findings: list[dict[str, Any]] = []
-    for field in _changed_keys(old_spec, new_spec):
+    for field in _semantic_changed_keys(old_spec, new_spec):
         if field == "selector":
             finding = _finding(
                 rules, SELECTOR_RULE_IDS[("apps", "StatefulSet")], "/spec/selector",
@@ -543,13 +625,13 @@ def _job_template_findings(
         metadata = template.get("metadata")
         if isinstance(metadata, dict) and not metadata:
             template.pop("metadata", None)
-    if _structural_equal(old_template, new_template):
+    if _semantic_equal(old_template, new_template):
         return []
     for template in (old_template, new_template):
         spec = template.get("spec")
         if isinstance(spec, dict):
             _apply_podspec_defaults(spec, pod_object=False)
-    if _structural_equal(old_template, new_template):
+    if _semantic_equal(old_template, new_template):
         finding = _finding(
             rules, "conditional-update-risk", "/spec/template",
             "Job spec.template differs only by omission versus known pod-spec defaults; "
@@ -570,7 +652,7 @@ def _job_template_findings(
         )
         return [finding] if finding is not None else []
     munged = _munge_suspended_template(old_template, new_template)
-    if _structural_equal(munged, new_template):
+    if _semantic_equal(munged, new_template):
         finding = _finding(
             rules, "conditional-update-risk", "/spec/template",
             "Job spec.template changes to scheduling directives, template labels or "
@@ -610,7 +692,7 @@ def _job_findings(
     old_selector = old_spec.get("selector")
     new_selector = new_spec.get("selector")
     if old_selector is not None and new_selector is not None:
-        if not _structural_equal(old_selector, new_selector):
+        if not _semantic_equal(old_selector, new_selector):
             finding = _finding(
                 rules, "job-selector-immutable", "/spec/selector",
                 "batch/v1 Job spec.selector is immutable when authored explicitly on both "
@@ -634,7 +716,7 @@ def _job_findings(
         _job_template_findings(rules, old_spec, new_spec, scenario_id, resource, minor)
     )
 
-    for field in sorted(_changed_keys(old_spec, new_spec)):
+    for field in sorted(_semantic_changed_keys(old_spec, new_spec)):
         rule_id = JOB_FIXED_FIELD_RULES.get(field)
         if rule_id is None:
             continue
@@ -653,7 +735,7 @@ def _job_findings(
     if minor == "1.37":
         old_scheduling = old_spec.get("scheduling")
         new_scheduling = new_spec.get("scheduling")
-        if not _structural_equal(old_scheduling, new_scheduling):
+        if not _semantic_equal(old_scheduling, new_scheduling):
             finding = _finding(
                 rules, "job-scheduling-update", "/spec/scheduling",
                 "Job spec.scheduling is new in Kubernetes 1.37 and carries feature-gated "
@@ -782,7 +864,7 @@ def _pod_update_violations(
                     "Direct Pod updates may not add, remove, or rename containers.",
                 ))
                 continue
-            for key in _changed_keys(old_container, new_container):
+            for key in _semantic_changed_keys(old_container, new_container):
                 if key == "image":
                     continue
                 if key == "resources":
@@ -919,7 +1001,7 @@ def _pod_update_violations(
                 munged.pop("affinity", None)
             else:
                 munged["affinity"] = munged_affinity
-    for key in _changed_keys(old_spec, munged):
+    for key in _semantic_changed_keys(old_spec, munged):
         already_reported = any(
             path == f"/spec/{key}" or path.startswith(f"/spec/{key}/")
             for path, _ in violations
@@ -949,11 +1031,11 @@ def _pod_findings(
 ) -> list[dict[str, Any]]:
     old_raw = _strip_nils(copy.deepcopy(_spec_of(old_document)))
     new_raw = _strip_nils(copy.deepcopy(_spec_of(new_document)))
-    if _structural_equal(old_raw, new_raw):
+    if _semantic_equal(old_raw, new_raw):
         return []
     _apply_podspec_defaults(old_raw, pod_object=True)
     _apply_podspec_defaults(new_raw, pod_object=True)
-    if _structural_equal(old_raw, new_raw):
+    if _semantic_equal(old_raw, new_raw):
         finding = _finding(
             rules, "conditional-update-risk", "/spec",
             "Direct Pod spec differs only by omission versus known pod-spec defaults "

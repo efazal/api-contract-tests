@@ -1083,6 +1083,211 @@ class TestDirectPod:
         assert findings == []
 
 
+class TestTypedZeroValueEquality:
+    """Nil-versus-empty and zero-value forms the API server treats as equal.
+
+    The audited update validators compare decoded objects with
+    apiequality.Semantic semantics: a nil slice equals an empty one, JSON
+    null equals omission, and the audited non-pointer spec strings equal
+    their Go zero value. The comparisons here pin those equivalences and
+    the distinctions deliberately kept (pointer presence, nonempty
+    collection changes, scalar zero values).
+    """
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS.values())
+    def test_selector_match_expressions_empty_list_equals_omission(
+        self, version: str
+    ) -> None:
+        baseline = deployment(selector={"matchLabels": {"app": "web"}})
+        candidate = deployment(
+            selector={"matchLabels": {"app": "web"}, "matchExpressions": []}
+        )
+        assert run([baseline], [candidate], scenario_for(version)) == []
+        assert run([candidate], [baseline], scenario_for(version)) == []
+
+    def test_selector_match_expressions_null_equals_omission(self) -> None:
+        candidate = deployment(
+            selector={"matchLabels": {"app": "web"}, "matchExpressions": None}
+        )
+        assert run([deployment()], [candidate]) == []
+
+    def test_selector_match_expressions_null_equals_empty_list(self) -> None:
+        baseline = deployment(
+            selector={"matchLabels": {"app": "web"}, "matchExpressions": None}
+        )
+        candidate = deployment(
+            selector={"matchLabels": {"app": "web"}, "matchExpressions": []}
+        )
+        assert run([baseline], [candidate]) == []
+
+    def test_selector_nonempty_match_expressions_change_still_errors(self) -> None:
+        candidate = deployment(selector={
+            "matchLabels": {"app": "web"},
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}],
+        })
+        findings = run([deployment()], [candidate])
+        finding = only(findings)
+        assert finding["id"] == "deployment-selector-immutable"
+        assert finding["path"] == "/spec/selector"
+
+    def test_selector_empty_to_nonempty_match_expressions_still_errors(self) -> None:
+        baseline = deployment(
+            selector={"matchLabels": {"app": "web"}, "matchExpressions": []}
+        )
+        candidate = deployment(selector={
+            "matchLabels": {"app": "web"},
+            "matchExpressions": [{"key": "tier", "operator": "In", "values": ["web"]}],
+        })
+        findings = run([baseline], [candidate])
+        finding = only(findings)
+        assert finding["id"] == "deployment-selector-immutable"
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS.values())
+    def test_statefulset_selector_match_expressions_empty_list_equals_omission(
+        self, version: str
+    ) -> None:
+        baseline = statefulset(selector={"matchLabels": {"app": "db"}})
+        candidate = statefulset(
+            selector={"matchLabels": {"app": "db"}, "matchExpressions": []}
+        )
+        assert run([baseline], [candidate], scenario_for(version)) == []
+        assert run([candidate], [baseline], scenario_for(version)) == []
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS.values())
+    def test_statefulset_volume_claim_templates_empty_list_equals_omission(
+        self, version: str
+    ) -> None:
+        assert run(
+            [statefulset(volumeClaimTemplates=None)],
+            [statefulset(volumeClaimTemplates=[])],
+            scenario_for(version),
+        ) == []
+        assert run(
+            [statefulset(volumeClaimTemplates=[])],
+            [statefulset(volumeClaimTemplates=None)],
+            scenario_for(version),
+        ) == []
+
+    def test_statefulset_volume_claim_templates_null_equals_omission(self) -> None:
+        candidate = statefulset(volumeClaimTemplates=None)
+        candidate["spec"]["volumeClaimTemplates"] = None
+        assert run([statefulset(volumeClaimTemplates=None)], [candidate]) == []
+
+    def test_statefulset_volume_claim_templates_growth_still_errors(self) -> None:
+        # Control for the equivalence above: adding a claim template is a
+        # substantive change and must keep erroring in every minor.
+        grown = statefulset(volumeClaimTemplates=[
+            {
+                "metadata": {"name": "data"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}},
+                },
+            },
+            {
+                "metadata": {"name": "wal"},
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}},
+                },
+            },
+        ])
+        for version in AUDITED_VERSIONS.values():
+            findings = run([statefulset()], [grown], scenario_for(version))
+            finding = only(findings)
+            assert finding["id"] == "statefulset-volume-claim-templates-immutable"
+            assert finding["path"] == "/spec/volumeClaimTemplates"
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS.values())
+    def test_statefulset_service_name_empty_string_equals_omission(
+        self, version: str
+    ) -> None:
+        # StatefulSetSpec.ServiceName is a non-pointer string in the pinned
+        # types: an omitted field and an explicit "" decode to the same Go
+        # zero value.
+        assert run(
+            [statefulset(serviceName=None)], [statefulset(serviceName="")],
+            scenario_for(version),
+        ) == []
+        assert run(
+            [statefulset(serviceName="")], [statefulset(serviceName=None)],
+            scenario_for(version),
+        ) == []
+
+    def test_statefulset_service_name_null_equals_omission(self) -> None:
+        candidate = statefulset()
+        candidate["spec"]["serviceName"] = None
+        assert run([statefulset(serviceName=None)], [candidate]) == []
+
+    def test_statefulset_service_name_empty_to_real_still_errors(self) -> None:
+        findings = run([statefulset(serviceName="")], [statefulset()])
+        finding = only(findings)
+        assert finding["id"] == "statefulset-service-name-immutable"
+        assert finding["path"] == "/spec/serviceName"
+
+    def test_statefulset_service_name_real_to_omitted_still_errors(self) -> None:
+        findings = run([statefulset()], [statefulset(serviceName=None)])
+        finding = only(findings)
+        assert finding["id"] == "statefulset-service-name-immutable"
+
+    def test_job_selector_match_expressions_empty_list_equals_omission(self) -> None:
+        selector = {"matchLabels": {"batch.kubernetes.io/controller-uid": "abc"}}
+        baseline = job(selector=dict(selector))
+        candidate = job(selector={**selector, "matchExpressions": []})
+        assert run([baseline], [candidate]) == []
+        assert run([candidate], [baseline]) == []
+
+    def test_pod_container_empty_collection_equals_omission(self) -> None:
+        # Container collections (env, ports, volumeMounts, ...) are
+        # non-pointer slices in the pinned types, and ValidatePodUpdate
+        # compares specs with Semantic equality, so an empty list added to
+        # an otherwise unchanged container is not an update violation.
+        baseline = pod()
+        candidate = pod()
+        candidate["spec"]["containers"][0]["env"] = []
+        assert run([baseline], [candidate]) == []
+        assert run([candidate], [baseline]) == []
+
+    def test_pod_container_empty_to_nonempty_collection_still_errors(self) -> None:
+        baseline = pod()
+        candidate = pod()
+        candidate["spec"]["containers"][0]["env"] = [
+            {"name": "MODE", "value": "fast"}
+        ]
+        findings = run([baseline], [candidate])
+        finding = only(findings)
+        assert finding["id"] == "pod-update-restricted"
+        assert finding["path"] == "/spec/containers/0/env"
+
+    def test_empty_mapping_is_not_equal_to_empty_list(self) -> None:
+        # Semantic distinguishes typed values: a present mapping decodes to
+        # a non-nil struct or pointer, never to a slice.
+        assert not policies._semantic_equal({}, [])
+        assert not policies._semantic_equal([], {})
+        assert not policies._semantic_equal(None, {})
+
+    def test_boolean_is_not_equal_to_number(self) -> None:
+        assert not policies._semantic_equal(False, 0)
+        assert not policies._semantic_equal(True, 1)
+
+    def test_absent_pointer_string_not_equal_to_explicit_empty(self) -> None:
+        # Job completionMode is a pointer (*CompletionMode): an explicit ""
+        # is a present pointer, not the nil pointer, so it stays a change
+        # even though the StatefulSet serviceName equivalence holds.
+        findings = run([job()], [job(completionMode="")])
+        finding = only(findings)
+        assert finding["id"] == "job-completion-mode-immutable"
+        assert finding["path"] == "/spec/completionMode"
+
+    def test_absent_pointer_struct_not_equal_to_empty_mapping(self) -> None:
+        # Job successPolicy is a pointer to a struct: {} versus omission is
+        # a real change (a present pointer), not a zero-value equivalence.
+        findings = run([job()], [job(successPolicy={})])
+        finding = only(findings)
+        assert finding["id"] == "job-success-policy-immutable"
+        assert finding["path"] == "/spec/successPolicy"
+
+
 class TestApiVersionCoverage:
     def test_beta_api_version_gets_partial_coverage_instead_of_stable_rules(self) -> None:
         beta_baseline = deployment(selector={"matchLabels": {"app": "web"}})
