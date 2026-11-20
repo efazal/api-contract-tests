@@ -428,7 +428,8 @@ class TestStatefulSet:
         assert finding["id"] == "statefulset-volume-claim-templates-immutable"
         assert finding["path"] == "/spec/volumeClaimTemplates"
 
-    def test_volume_claim_template_storage_growth_is_conditional(self) -> None:
+    @pytest.mark.parametrize("version", ["1.35.10", "1.36.6", "1.37.2"])
+    def test_volume_claim_template_storage_growth_is_an_error(self, version: str) -> None:
         candidate = statefulset(
             volumeClaimTemplates=[
                 {
@@ -440,12 +441,26 @@ class TestStatefulSet:
                 }
             ]
         )
-        findings = run([statefulset()], [candidate])
+        findings = run([statefulset()], [candidate], scenario_for(version))
         finding = only(findings)
-        assert finding["id"] == "conditional-update-risk"
-        assert finding["severity"] == "warn"
-        assert finding["evidence"] == "unverified"
+        assert finding["id"] == "statefulset-volume-claim-templates-immutable"
+        assert finding["severity"] == "error"
         assert finding["path"] == "/spec/volumeClaimTemplates"
+        assert "provision" not in finding["text"]
+
+    def test_volume_claim_template_equivalent_quantity_is_not_a_change(self) -> None:
+        candidate = statefulset(
+            volumeClaimTemplates=[
+                {
+                    "metadata": {"name": "data"},
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1024Mi"}},
+                    },
+                }
+            ]
+        )
+        assert run([statefulset()], [candidate]) == []
 
     def test_volume_claim_template_storage_decrease_is_an_error(self) -> None:
         candidate = statefulset(

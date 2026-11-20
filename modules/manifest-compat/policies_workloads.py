@@ -28,12 +28,11 @@ Deliberate boundaries, documented per the standing rules:
 
 - Only same-identity objects are compared; removals are handled elsewhere.
 - Suspended-Job scheduling-directive and container-resource template
-  changes, one-sided Job selectors, spec.scheduling changes, StatefulSet
-  claim-template storage growth, and omission-versus-default differences
-  are conditional warnings: their eligibility depends on live status,
-  feature gates, or request-path defaulting that rendered YAML cannot
-  prove. Absent YAML status is never treated as evidence of a
-  never-started Job.
+  changes, one-sided Job selectors, spec.scheduling changes, and
+  omission-versus-default differences are conditional warnings: their
+  eligibility depends on live status, feature gates, or request-path
+  defaulting that rendered YAML cannot prove. Absent YAML status is never
+  treated as evidence of a never-started Job.
 - The modelled pod-spec defaults are the unconditional SetDefaults_PodSpec
   values (dnsPolicy, restartPolicy, schedulerName, securityContext,
   terminationGracePeriodSeconds, serviceAccount aliasing) plus the Pod-only
@@ -54,7 +53,6 @@ Deliberate boundaries, documented per the standing rules:
 from __future__ import annotations
 
 import copy
-from fractions import Fraction
 from typing import Any
 
 EXPECTED_API_VERSIONS: dict[str, str] = {
@@ -155,21 +153,6 @@ def _spec_of(document: dict[str, Any]) -> dict[str, Any]:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _quantity_value(value: Any) -> Fraction | None:
-    """Parse the canonical quantity strings produced by the normalizer."""
-    if _is_int(value):
-        return Fraction(value)
-    if isinstance(value, str):
-        try:
-            if "/" in value:
-                numerator, denominator = value.split("/", 1)
-                return Fraction(int(numerator), int(denominator))
-            return Fraction(value)
-        except (ValueError, ZeroDivisionError):
-            return None
-    return None
 
 
 def _copy_field(destination: dict[str, Any], source: dict[str, Any], key: str) -> None:
@@ -351,48 +334,6 @@ def _selector_findings(
     return [finding] if finding is not None else []
 
 
-def _volume_claim_templates_growth_only(
-    old_templates: Any, new_templates: Any
-) -> bool:
-    """True when the only change is a strictly larger storage request."""
-    if not isinstance(old_templates, list) or not isinstance(new_templates, list):
-        return False
-    if len(old_templates) != len(new_templates):
-        return False
-    grew = False
-    for old_template, new_template in zip(old_templates, new_templates):
-        if not isinstance(old_template, dict) or not isinstance(new_template, dict):
-            return False
-        old_masked = copy.deepcopy(old_template)
-        new_masked = copy.deepcopy(new_template)
-        old_storage = _pop_storage_request(old_masked)
-        new_storage = _pop_storage_request(new_masked)
-        if not _structural_equal(old_masked, new_masked):
-            return False
-        old_value = _quantity_value(old_storage)
-        new_value = _quantity_value(new_storage)
-        if old_storage is None and new_storage is None:
-            continue
-        if old_value is None or new_value is None or new_value < old_value:
-            return False
-        if new_value > old_value:
-            grew = True
-    return grew
-
-
-def _pop_storage_request(template: dict[str, Any]) -> Any:
-    spec = template.get("spec")
-    if not isinstance(spec, dict):
-        return None
-    resources = spec.get("resources")
-    if not isinstance(resources, dict):
-        return None
-    requests = resources.get("requests")
-    if not isinstance(requests, dict):
-        return None
-    return requests.pop("storage", None)
-
-
 def _statefulset_findings(
     rules: dict[str, dict[str, Any]],
     old_document: dict[str, Any],
@@ -415,21 +356,6 @@ def _statefulset_findings(
             if finding is not None:
                 findings.append(finding)
         elif field in STATEFULSET_IMMUTABLE_RULES:
-            if field == "volumeClaimTemplates" and _volume_claim_templates_growth_only(
-                old_spec.get(field), new_spec.get(field)
-            ):
-                finding = _finding(
-                    rules, "conditional-update-risk", "/spec/volumeClaimTemplates",
-                    "StatefulSet spec.volumeClaimTemplates storage requests grow. Update "
-                    "validation rejects volumeClaimTemplates changes, but whether the growth is "
-                    "provisionable for existing claims cannot be decided from rendered YAML, so "
-                    "the change is reported as a conditional risk rather than a definite "
-                    "rejection.",
-                    scenario_id, resource, minor,
-                )
-                if finding is not None:
-                    findings.append(finding)
-                continue
             finding = _finding(
                 rules, STATEFULSET_IMMUTABLE_RULES[field], f"/spec/{field}",
                 f"apps/v1 StatefulSet spec.{field} is immutable"
