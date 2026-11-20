@@ -66,6 +66,10 @@ data:
   beta: two
 """
 
+# Valid YAML that the raw renderer accepts (it only parses and concatenates
+# sources) but the normalizer rejects: a document with no apiVersion or kind.
+MALFORMED_YAML = "notAKubernetesObject: true\n"
+
 CONFIGMAP_ADDED = """apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -719,6 +723,183 @@ class TestNewDeclarations:
         entry = report["baselines"][0]["scenarios"]["app"]
         assert entry["status"] == "error"
         assert "cannot be empty" in entry["errors"][0]
+
+
+# ---------------------------------------------------------------------------
+# Baseline failure isolation
+# ---------------------------------------------------------------------------
+
+class TestBaselineFailureIsolation:
+    def test_malformed_first_baseline_keeps_later_baseline_evidence(
+            self, repo: Repo, outputs: Path) -> None:
+        # The first baseline renders (raw concatenation) but cannot be
+        # normalized; the second baseline is valid and must still be fully
+        # compared, with the first retaining its SHA and scenario evidence
+        # instead of being left incorrectly not-run.
+        repo.write("manifests/sc.yaml", MALFORMED_YAML)
+        repo.descriptor([repo.raw_scenario()])
+        broken = repo.commit()
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        valid = repo.commit()
+        repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
+
+        result, report = repo.check([broken, valid], outputs / "enforce", mode="enforce")
+        assert result.returncode == 2
+        assert report["status"] == "error"
+
+        first, second = report["baselines"]
+        assert first["ref"] == broken
+        assert first["sha"] == broken
+        assert first["status"] == "error"
+        assert first["scenarios"]["app"]["status"] == "error"
+        assert "normalization failed" in first["scenarios"]["app"]["errors"][0]
+        assert "missing apiVersion or kind" in first["scenarios"]["app"]["errors"][0]
+        assert first["findings"] == []
+        assert first["associated_candidate_findings"] == []
+        assert any(
+            error.startswith(f"baseline {broken} scenario error:")
+            and "missing apiVersion or kind" in error
+            for error in report["errors"]
+        )
+
+        assert second["ref"] == valid
+        assert second["sha"] == valid
+        assert second["status"] == "compared"
+        assert second["scenarios"]["app"]["status"] == "compared"
+        assert finding_ids(report, index=1) == ["storageclass-provisioner-immutable"]
+        assert second["compatible"] is False
+
+        # Integrity errors dominate in report mode too: exit 2 even though
+        # the valid baseline's breaking finding would otherwise exit 0.
+        reported, _ = repo.check([broken, valid], outputs / "report", mode="report-only")
+        assert reported.returncode == 2
+
+    def test_malformed_scenario_keeps_sibling_scenario_findings(
+            self, repo: Repo, outputs: Path) -> None:
+        # A scenario that fails normalization must not prevent another
+        # scenario in the same baseline from completing: its comparison
+        # evidence stays in the report alongside the error entry.
+        repo.write("manifests/bad.yaml", MALFORMED_YAML)
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([
+            repo.raw_scenario("broken", sources=["manifests/bad.yaml"]),
+            repo.raw_scenario("storage", sources=["manifests/sc.yaml"]),
+        ])
+        baseline = repo.commit()
+        repo.write("manifests/bad.yaml", CONFIGMAP)
+        repo.write("manifests/sc.yaml", STORAGE_CLASS_CHANGED)
+
+        result, report = repo.check([baseline], outputs / "r1", mode="enforce")
+        assert result.returncode == 2
+        assert report["status"] == "error"
+        baseline_entry = report["baselines"][0]
+        assert baseline_entry["sha"] == baseline
+        assert baseline_entry["status"] == "error"
+        assert baseline_entry["scenarios"]["broken"]["status"] == "error"
+        assert "normalization failed" in baseline_entry["scenarios"]["broken"]["errors"][0]
+        assert baseline_entry["scenarios"]["storage"]["status"] == "compared"
+        assert finding_ids(report) == ["storageclass-provisioner-immutable"]
+        finding = finding_for(report, "storageclass-provisioner-immutable")
+        assert finding["scenario"] == "storage"
+
+    def test_injected_comparison_failure_isolates_the_scenario(
+            self, repo: Repo, outputs: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A comparison-module crash is contained at the scenario boundary:
+        # the failing scenario records the error with its type name, the
+        # sibling scenario still compares, and the baseline keeps its SHA.
+        repo.write("manifests/one.yaml", CONFIGMAP)
+        repo.write("manifests/two.yaml", STORAGE_CLASS)
+        repo.descriptor([
+            repo.raw_scenario("first", sources=["manifests/one.yaml"]),
+            repo.raw_scenario("second", sources=["manifests/two.yaml"]),
+        ])
+        baseline = repo.commit()
+        repo.write("manifests/two.yaml", STORAGE_CLASS_CHANGED)
+
+        modules = runner._modules()
+        real_compare = modules["storage_service"].compare
+
+        def injected(baseline_map: dict, candidate_map: dict,
+                     scenario: dict, catalogue: dict) -> list:
+            if scenario.get("id") == "first":
+                raise RuntimeError("injected comparison crash")
+            return real_compare(baseline_map, candidate_map, scenario, catalogue)
+
+        monkeypatch.setattr(modules["storage_service"], "compare", injected)
+        output = outputs / "r1"
+        args = argparse.Namespace(
+            repo=repo.root, manifest_set=Path(".rhoai/manifests.yaml"),
+            baseline_ref=[baseline], output_dir=output, enforce=True,
+            tool_cache_dir=None, scenario_id=None,
+        )
+        code = runner.run_check(args)
+        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+        assert code == 2
+        assert report["status"] == "error"
+        baseline_entry = report["baselines"][0]
+        assert baseline_entry["sha"] == baseline
+        assert baseline_entry["status"] == "error"
+        assert baseline_entry["scenarios"]["first"]["status"] == "error"
+        assert baseline_entry["scenarios"]["first"]["errors"] == [
+            "comparison failed: RuntimeError: injected comparison crash"
+        ]
+        assert baseline_entry["scenarios"]["second"]["status"] == "compared"
+        assert finding_ids(report) == ["storageclass-provisioner-immutable"]
+        # The candidate side is untouched by the baseline-side crash.
+        assert report["candidate"]["scenarios"]["first"]["status"] == "ready"
+
+    def test_postprocessing_failure_leaves_no_candidate_associations(
+            self, repo: Repo, outputs: Path) -> None:
+        # Exception accounting runs after correlation matches the duplicate
+        # to the shared candidate finding. When it rejects a waive attempt,
+        # the scenario fails: the pending associations must not be applied,
+        # so neither side of the report keeps a link for processing that
+        # never completed, and no partial findings are published.
+        baseline = self.correlation_setup(repo)
+        finding = self.waive_target(repo, baseline, outputs / "probe")
+        repo.descriptor([repo.raw_scenario(exceptions=[{
+            "ruleId": "required-reference-lost",
+            "resource": finding["resource"],
+            "path": finding["baseline_associations"][0]["path"],
+            "baselineRef": baseline,
+            "relatedResource": finding["related_resource"],
+            "edgeId": finding["baseline_associations"][0]["edge_id"],
+            "reason": "attempt to waive candidate validation",
+        }])])
+
+        result, report = repo.check([baseline], outputs / "r2", mode="enforce")
+        assert result.returncode == 2
+        assert report["status"] == "error"
+        assert any("cannot be waived" in error for error in report["errors"])
+        baseline_entry = report["baselines"][0]
+        assert baseline_entry["sha"] == baseline
+        assert baseline_entry["status"] == "error"
+        assert baseline_entry["scenarios"]["app"]["status"] == "error"
+        assert "comparison failed" in baseline_entry["scenarios"]["app"]["errors"][0]
+        assert baseline_entry["findings"] == []
+        assert baseline_entry["associated_candidate_findings"] == []
+        candidate_side = [f for f in report["candidate_findings"] if "env" in f["path"]]
+        assert candidate_side, "candidate validation finding must still be reported"
+        # Candidate findings initialize baseline_associations to [], so the
+        # rollback assertion is emptiness, not key absence.
+        assert all(not f.get("baseline_associations") for f in candidate_side)
+
+    def correlation_setup(self, repo: Repo) -> str:
+        repo.write("manifests/cm.yaml", CONFIGMAP)
+        repo.write("manifests/dep.yaml", DEPLOYMENT_WITH_ENV)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        repo.write("manifests/cm.yaml", CONFIGMAP_KEY_DROPPED)
+        return baseline
+
+    def waive_target(self, repo: Repo, baseline: str,
+                     output: Path) -> dict[str, Any]:
+        # A first successful run produces the association the exception will
+        # target; the second run must roll it back when accounting fails.
+        _, report = repo.check([baseline], output, mode="enforce")
+        findings = [f for f in report["candidate_findings"] if "env" in f["path"]]
+        assert len(findings) == 1
+        return findings[0]
 
 
 # ---------------------------------------------------------------------------

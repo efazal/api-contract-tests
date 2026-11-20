@@ -358,16 +358,19 @@ def _compare_scenario(baseline_map: dict[str, Any], candidate_map: dict[str, Any
 
 def _correlate_candidate_edges(baseline_findings: list[dict[str, Any]],
                                candidate_findings: Sequence[dict[str, Any]],
-                               ref: str, sha: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+                               ref: str, sha: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[tuple[dict[str, Any], dict[str, Any]]]]:
     """Absorb comparison duplicates of already-reported candidate findings.
 
-    Returns (retained findings, absorbed findings, association links);
-    absorbed findings are removed from the retained list so each failing
-    logical slot is reported exactly once. Retained candidate findings
-    gain ``baseline_associations`` entries carrying the original baseline
-    edge ID/pointers; each affected baseline gains an
-    ``associated_candidate_findings`` link using the retained candidate
-    edge ID.
+    Returns (retained findings, absorbed findings, association links,
+    pending associations); absorbed findings are removed from the retained
+    list so each failing logical slot is reported exactly once. Pending
+    associations are (candidate finding, association) pairs the caller
+    attaches with :func:`_apply_candidate_associations` once the scenario's
+    exception accounting succeeds: applying them only after the whole
+    scenario completes keeps the shared candidate findings free of links
+    representing processing that never finished. Each affected baseline
+    gains an ``associated_candidate_findings`` link using the retained
+    candidate edge ID.
     """
     candidate_index: dict[tuple[str, str, str], dict[str, Any]] = {}
     for finding in candidate_findings:
@@ -378,6 +381,7 @@ def _correlate_candidate_edges(baseline_findings: list[dict[str, Any]],
     absorbed: list[dict[str, Any]] = []
     links: list[dict[str, Any]] = []
     retained: list[dict[str, Any]] = []
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for finding in baseline_findings:
         candidate_edge_id = finding.get("candidate_edge_id")
         key = (str(finding.get("scenario")), str(finding.get("id")), str(candidate_edge_id))
@@ -389,14 +393,13 @@ def _correlate_candidate_edges(baseline_findings: list[dict[str, Any]],
             and _identity_tuple(finding.get("related_resource") or {})
             == _identity_tuple(match.get("related_resource") or {})
         ):
-            associations = match.setdefault("baseline_associations", [])
-            associations.append({
+            pending.append((match, {
                 "ref": ref,
                 "sha": sha,
                 "edge_id": finding.get("edge_id"),
                 "path": finding.get("path"),
                 "related_path": finding.get("related_path"),
-            })
+            }))
             links.append({
                 "scenario": match.get("scenario"),
                 "id": match.get("id"),
@@ -405,7 +408,26 @@ def _correlate_candidate_edges(baseline_findings: list[dict[str, Any]],
             absorbed.append(finding)
         else:
             retained.append(finding)
-    return retained, absorbed, links
+    return retained, absorbed, links, pending
+
+
+def _apply_candidate_associations(
+    pending: Sequence[tuple[dict[str, Any], dict[str, Any]]]
+) -> None:
+    """Attach correlation associations to the shared candidate findings."""
+    for finding, association in pending:
+        finding.setdefault("baseline_associations", []).append(association)
+
+
+def _scenario_integrity_error(stage: str, error: BaseException) -> str:
+    """Attribute a scenario-local integrity failure to its processing stage.
+
+    Expected failure types keep their plain message; anything else keeps its
+    type name so unexpected internal errors stay diagnosable in the report.
+    """
+    if isinstance(error, (CheckError, OSError, ValueError)):
+        return f"{stage} failed: {error}"
+    return f"{stage} failed: {type(error).__name__}: {error}"
 
 
 def _exception_matches(exception: Mapping[str, Any], finding: Mapping[str, Any],
@@ -760,7 +782,14 @@ def run_check(args: argparse.Namespace) -> int:
                             "present; a present historical input must be compared, not declared new"
                         )
                         continue
-                    normalized = modules["normalizer"].normalize(content, f"baseline:{scenario_id}", effective)
+                    try:
+                        normalized = modules["normalizer"].normalize(
+                            content, f"baseline:{scenario_id}", effective
+                        )
+                    except Exception as error:  # noqa: BLE001 - scenario integrity boundary
+                        entry["status"] = "error"
+                        entry["errors"].append(_scenario_integrity_error("normalization", error))
+                        continue
                     if normalized["coverage"]["object_count"] == 0:
                         entry["status"] = "error"
                         entry["errors"].append(
@@ -770,15 +799,27 @@ def run_check(args: argparse.Namespace) -> int:
                         continue
                     entry["digest"] = digest(content)
                     entry["object_count"] = normalized["coverage"]["object_count"]
-                    findings = _compare_scenario(
-                        normalized, candidate_maps[scenario_id], scenario, catalogue, modules
-                    )
-                    findings, absorbed, scenario_links = _correlate_candidate_edges(
-                        findings, report["candidate_findings"], ref, sha
-                    )
-                    stale = _apply_exceptions(
-                        findings, absorbed, scenario, ref, catalogue, rules
-                    )
+                    try:
+                        findings = _compare_scenario(
+                            normalized, candidate_maps[scenario_id], scenario, catalogue, modules
+                        )
+                        findings, absorbed, scenario_links, pending = _correlate_candidate_edges(
+                            findings, report["candidate_findings"], ref, sha
+                        )
+                        stale = _apply_exceptions(
+                            findings, absorbed, scenario, ref, catalogue, rules
+                        )
+                    except Exception as error:  # noqa: BLE001 - scenario integrity boundary
+                        # Comparison, correlation, or exception accounting
+                        # failed: the scenario's findings are discarded whole
+                        # (nothing partial reaches `flattened`) and the
+                        # correlation associations stay pending, so neither
+                        # side of the report keeps a link representing
+                        # processing that never completed.
+                        entry["status"] = "error"
+                        entry["errors"].append(_scenario_integrity_error("comparison", error))
+                        continue
+                    _apply_candidate_associations(pending)
                     for finding in findings:
                         finding["baseline_ref"] = ref
                         finding["baseline_sha"] = sha
