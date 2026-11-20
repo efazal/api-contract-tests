@@ -292,6 +292,50 @@ class TestAuditedCorrections:
         rule = next(rule for rule in rules if rule["id"] == "controllerrevision-data-immutable")
         assert rule["paths"] == ["data"]
 
+    def test_policy_version_records_the_pvc_and_workload_corrections(self, policy: dict[str, Any]) -> None:
+        # 1.3.0: residual PVC spec immutability, claim-template growth as an
+        # error, and the typed workload equality corrections.
+        assert policy["policy_version"] == "1.3.0"
+
+    def test_pvc_residual_spec_rule_is_registered(self, rules: list[dict[str, Any]]) -> None:
+        rule = next(rule for rule in rules if rule["id"] == "pvc-spec-immutable")
+        assert rule["strategy"] == "whole-spec-immutable"
+        assert rule["severity"] == "error"
+        assert rule["evidence"] == "api-rule"
+        assert rule["classification"] == "immutable"
+        assert rule["waiver_eligibility"] == "baseline-comparison-only"
+        assert rule["versions"] == ["1.35", "1.36", "1.37"]
+        assert {source["minor"] for source in rule["sources"]} == {"1.35", "1.36", "1.37"}
+        assert any("resources.limits" in guard for guard in rule["guards"]), (
+            "the residual rule must name the review's concrete gap (spec.resources.limits)"
+        )
+
+    def test_statefulset_claim_template_growth_is_error_not_warning(self, rules: list[dict[str, Any]]) -> None:
+        # Task 004 made every substantive claim-template change an error; the
+        # catalogue guard must not still describe growth as warning-only.
+        rule = next(
+            rule for rule in rules
+            if rule["id"] == "statefulset-volume-claim-templates-immutable"
+        )
+        joined = " ".join(rule["guards"])
+        assert "conditional-update-risk" not in joined
+        assert "growth" in joined or "growing" in joined
+        assert rule["severity"] == "error"
+
+    def test_pvc_nil_to_empty_storage_class_is_not_rejected(self, rules: list[dict[str, Any]]) -> None:
+        # Source-audited correction of the review premise: the migration rule
+        # must not forbid nil -> "" — validateStorageClassUpgradeFromNil
+        # checks pointer nilness, and class-name validation skips empty
+        # strings at all three pinned commits.
+        rule = next(
+            rule for rule in rules if rule["id"] == "pvc-storage-class-name-immutable"
+        )
+        joined = " ".join(rule["guards"])
+        assert "unset-to-set" in joined
+        assert "empty" not in joined or "nonempty" not in joined, (
+            "the guard must not require a nonempty migrated class name"
+        )
+
 
 class TestRelationalMetadata:
     def test_relational_rules_are_declared(self, rules: list[dict[str, Any]]) -> None:

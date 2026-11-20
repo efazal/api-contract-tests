@@ -469,6 +469,127 @@ class TestPersistentVolumeClaim:
         one(run_compare(baseline, candidate), "pvc-storage-class-name-immutable",
             "/metadata/annotations/volume.beta.kubernetes.io~1storage-class")
 
+    def test_storage_class_nil_to_empty_string_migration(self) -> None:
+        # Source-verified premise correction: validateStorageClassUpgradeFromNil
+        # requires a non-nil new pointer, not a nonempty value, and class-name
+        # validation deliberately skips empty strings. nil -> "" is therefore
+        # permitted under the same annotation conditions as nil -> "fast".
+        baseline = PVC_BASELINE.replace("  storageClassName: slow\n", "")
+        candidate = PVC_BASELINE.replace("  storageClassName: slow", '  storageClassName: ""')
+        assert run_compare(baseline, candidate) == []
+
+    def test_storage_class_nil_to_empty_with_conflicting_annotation_is_caught(self) -> None:
+        baseline = PVC_BASELINE.replace(
+            "  storageClassName: slow",
+            "",
+        ).replace(
+            "metadata:\n  name: data-pvc",
+            "metadata:\n  name: data-pvc\n  annotations:\n"
+            "    volume.beta.kubernetes.io/storage-class: fast",
+        )
+        candidate = PVC_BASELINE.replace("  storageClassName: slow", '  storageClassName: ""')
+        findings = run_compare(baseline, candidate)
+        one(findings, "pvc-storage-class-name-immutable", "/spec/storageClassName")
+
+    def test_storage_class_existing_empty_value_is_frozen(self) -> None:
+        # An already-set (non-nil) empty class name is not the nil upgrade:
+        # changing it to any other value is a violation.
+        baseline = PVC_BASELINE.replace("  storageClassName: slow", '  storageClassName: ""')
+        candidate = PVC_BASELINE.replace("  storageClassName: slow", "  storageClassName: fast")
+        one(run_compare(baseline, candidate), "pvc-storage-class-name-immutable",
+            "/spec/storageClassName")
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS)
+    def test_resources_limits_addition_is_caught(self, version: str) -> None:
+        scenario = dict(SCENARIO, kubernetesVersion=version)
+        candidate = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10Gi",
+        )
+        one(run_compare(PVC_BASELINE, candidate, scenario),
+            "pvc-spec-immutable", "/spec")
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS)
+    def test_resources_limits_change_is_caught(self, version: str) -> None:
+        scenario = dict(SCENARIO, kubernetesVersion=version)
+        baseline = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10Gi",
+        )
+        candidate = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 20Gi",
+        )
+        one(run_compare(baseline, candidate, scenario),
+            "pvc-spec-immutable", "/spec")
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS)
+    def test_resources_limits_removal_is_caught(self, version: str) -> None:
+        scenario = dict(SCENARIO, kubernetesVersion=version)
+        baseline = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10Gi",
+        )
+        one(run_compare(baseline, PVC_BASELINE, scenario),
+            "pvc-spec-immutable", "/spec")
+
+    @pytest.mark.parametrize("version", AUDITED_VERSIONS)
+    def test_unknown_spec_field_change_is_caught(self, version: str) -> None:
+        scenario = dict(SCENARIO, kubernetesVersion=version)
+        candidate = PVC_BASELINE + "  someFutureField: value\n"
+        one(run_compare(PVC_BASELINE, candidate, scenario),
+            "pvc-spec-immutable", "/spec")
+
+    def test_non_storage_request_key_change_is_caught(self) -> None:
+        # Upstream masks only requests["storage"] for bound claims; any other
+        # request key is part of the whole-spec comparison.
+        candidate = PVC_BASELINE.replace(
+            "    requests:\n      storage: 5Gi",
+            "    requests:\n      storage: 5Gi\n      cpu: \"1\"",
+        )
+        one(run_compare(PVC_BASELINE, candidate), "pvc-spec-immutable", "/spec")
+
+    def test_specific_rules_are_not_duplicated_by_residual(self) -> None:
+        # A change covered by a specific rule must not also emit the residual
+        # whole-spec finding.
+        candidate = PVC_BASELINE.replace(
+            "  accessModes:\n  - ReadWriteOnce", "  accessModes:\n  - ReadOnlyMany"
+        )
+        findings = run_compare(PVC_BASELINE, candidate)
+        assert ids(findings) == ["pvc-access-modes-immutable"]
+
+        candidate = PVC_BASELINE.replace("  storageClassName: slow", "  storageClassName: fast")
+        findings = run_compare(PVC_BASELINE, candidate)
+        assert ids(findings) == ["pvc-storage-class-name-immutable"]
+
+        candidate = PVC_BASELINE.replace("      storage: 5Gi", "      storage: 8Gi")
+        findings = run_compare(PVC_BASELINE, candidate)
+        assert ids(findings) == ["pvc-storage-resize-risk"]
+
+    def test_storage_only_requests_mask_to_absent_resources(self) -> None:
+        # With requests.storage owned by the resize risk rule, a spec whose
+        # only resource is that request compares equal to one with no
+        # resources block at all: the emptied containers are pruned.
+        baseline = PVC_BASELINE
+        candidate = PVC_BASELINE.replace(
+            "  resources:\n    requests:\n      storage: 5Gi\n", ""
+        )
+        findings = run_compare(baseline, candidate)
+        assert ids(findings) == ["pvc-storage-resize-risk"]
+
+    def test_volume_name_init_alongside_residual_change_reports_both(self) -> None:
+        # The one-time volumeName initialization stays permitted while an
+        # unrelated residual change still errors: distinct fields, distinct
+        # findings.
+        candidate = PVC_BASELINE.replace(
+            "spec:\n", "spec:\n  volumeName: data-pv\n"
+        ).replace(
+            "  resources:\n    requests:\n      storage: 5Gi",
+            "  resources:\n    requests:\n      storage: 5Gi\n    limits:\n      storage: 10Gi",
+        )
+        findings = run_compare(PVC_BASELINE, candidate)
+        assert ids(findings) == ["pvc-spec-immutable"]
+
     def test_storage_decrease_warns_naming_missing_evidence(self) -> None:
         candidate = PVC_BASELINE.replace("      storage: 5Gi", "      storage: 3Gi")
         finding = one(

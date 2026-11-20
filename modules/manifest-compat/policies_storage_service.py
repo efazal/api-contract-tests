@@ -13,8 +13,10 @@ at the three pinned Kubernetes commits.
 Three behavior classes are deliberately distinguished:
 
 * Provable violations (error): frozen PV volume-source union and volumeMode,
-  PVC accessModes/selector/dataSource/dataSourceRef/volumeMode, explicit
-  primary Service addresses and families, and conditional loadBalancerClass
+  PVC accessModes/selector/dataSource/dataSourceRef/volumeMode, the PVC
+  residual whole-spec comparison (every remaining spec field, for example
+  resources.limits, after the audited maskings), explicit primary Service
+  addresses and families, and conditional loadBalancerClass
   and healthCheckNodePort edits.
 * Source-verified transitions (compatible): the one-time PV
   controllerExpandSecretRef and PVC volumeName initializations, the exact PVC
@@ -53,6 +55,20 @@ PV_SOURCE_FIELDS: tuple[str, ...] = (
 
 BETA_STORAGE_CLASS_ANNOTATION = "volume.beta.kubernetes.io/storage-class"
 BETA_STORAGE_CLASS_POINTER = "/metadata/annotations/volume.beta.kubernetes.io~1storage-class"
+
+# PVC spec fields dropped from the residual whole-spec comparison. Each has
+# a specific registered rule (or audited transition) that fully covers its
+# changes, so masking it here guarantees one change never produces both a
+# specific finding and the residual pvc-spec-immutable finding. Upstream
+# masks volumeName initialization, the two storage-class migrations, and —
+# only for bound claims, whose live status rendered YAML cannot prove —
+# resources.requests.storage and volumeAttributesClassName the same way
+# before the whole-spec Semantic.DeepEqual in
+# ValidatePersistentVolumeClaimUpdate.
+_PVC_RESIDUAL_MASKED_SPEC_FIELDS: frozenset[str] = frozenset({
+    "accessModes", "selector", "dataSource", "dataSourceRef", "volumeMode",
+    "volumeName", "storageClassName", "volumeAttributesClassName",
+})
 
 SERVICE_EXTERNAL_NAME = "ExternalName"
 SERVICE_LOAD_BALANCER = "LoadBalancer"
@@ -431,7 +447,55 @@ def _compare_persistent_volume_claim(
         if finding is not None:
             findings.append(finding)
 
+    if not _semantic_equal(
+        _pvc_residual_spec(old_spec), _pvc_residual_spec(new_spec)
+    ):
+        finding = ctx.finding(
+            "pvc-spec-immutable", "/spec",
+            "PersistentVolumeClaim spec is immutable after creation except "
+            "resources.requests.storage and volumeAttributesClassName for bound claims; the "
+            "candidate changes a spec field that no specific rule covers (for example "
+            "spec.resources.limits), which the whole-spec comparison in "
+            "ValidatePersistentVolumeClaimUpdate rejects.",
+        )
+        if finding is not None:
+            findings.append(finding)
+
     return findings
+
+
+def _pvc_residual_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Copy of a PVC spec reduced to what the residual comparison covers.
+
+    Drops every field masked by a specific rule or audited transition (see
+    ``_PVC_RESIDUAL_MASKED_SPEC_FIELDS``) and the ``storage`` request key
+    (the storage-resize risk rule owns it, since bound-claim status is
+    unknowable from rendered YAML). Empty containers left by the masking
+    are pruned so an emptied ``requests``/``resources`` compares equal to
+    an omitted one, matching Go zero-value decoding. The caller's
+    dictionary is never mutated.
+    """
+    residual = {
+        key: value for key, value in spec.items()
+        if key not in _PVC_RESIDUAL_MASKED_SPEC_FIELDS
+    }
+    resources = residual.get("resources")
+    if isinstance(resources, dict):
+        resources = dict(resources)
+        requests = resources.get("requests")
+        if isinstance(requests, dict):
+            requests = {
+                key: value for key, value in requests.items() if key != "storage"
+            }
+            if requests:
+                resources["requests"] = requests
+            else:
+                resources.pop("requests", None)
+        if resources:
+            residual["resources"] = resources
+        else:
+            residual.pop("resources", None)
+    return residual
 
 
 def _cluster_ips(spec: dict[str, Any]) -> tuple[list[Any], bool]:

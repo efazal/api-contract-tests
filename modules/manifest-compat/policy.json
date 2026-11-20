@@ -1,5 +1,5 @@
 {
-  "policy_version": "1.2.0",
+  "policy_version": "1.3.0",
   "description": "Finite, source-audited finding-ID registry and immutable/update-restriction catalogue for the Kubernetes manifest compatibility check. API rules are grounded in upstream Kubernetes validators, registry update strategies, and defaulting at the pinned commits. Repository-policy rules are project-defined graph/contract enforcement. This catalogue does not claim to be a universal Kubernetes immutability schema.",
   "kubernetes": {
     "supported_minor_versions": ["1.35", "1.36", "1.37"],
@@ -199,7 +199,7 @@
       "paths": ["spec.volumeClaimTemplates"],
       "strategy": "semantic-equal-immutable",
       "defaults": {"spec.volumeClaimTemplates[*].spec.volumeMode": "Filesystem"},
-      "guards": ["Compare nested values after known defaulting (volumeMode defaults to Filesystem); storage-size growth inside a claim template cannot be certified as provisionable and is reported by conditional-update-risk instead of this rule."],
+      "guards": ["Compare nested values after known defaulting (volumeMode defaults to Filesystem). Every substantive change is a violation in all supported minors, including adding or removing a claim template and growing a storage request inside one; the standalone PVC resize risk rule does not apply to templates."],
       "versions": ["1.35", "1.36", "1.37"],
       "version_behavior": {
         "1.35": "Enforced indirectly through the spec allowlist (statefulset-spec-field-forbidden).",
@@ -1347,6 +1347,29 @@
         {"minor": "1.35", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2539"},
         {"minor": "1.36", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2532"},
         {"minor": "1.37", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2628-2642"}
+      ]
+    },
+    {
+      "id": "pvc-spec-immutable",
+      "family": "storage",
+      "status": "active",
+      "authority": "api-rule",
+      "group": "",
+      "kind": "PersistentVolumeClaim",
+      "api_versions": ["v1"],
+      "paths": ["spec"],
+      "strategy": "whole-spec-immutable",
+      "guards": ["Residual whole-spec comparison mirroring ValidatePersistentVolumeClaimUpdate: after the one-time volumeName initialization, the two source-verified storageClassName migrations, and the bound-claim maskings of resources.requests.storage and volumeAttributesClassName (bound status is not provable from rendered YAML, so those two keep their risk rules), every remaining spec difference is forbidden. Fields with specific registered rules are masked from this comparison so one change never yields both a specific and a residual finding; the rule therefore covers fields like spec.resources.limits and unknown or future spec fields."],
+      "versions": ["1.35", "1.36", "1.37"],
+      "severity": "error",
+      "evidence": "api-rule",
+      "classification": "immutable",
+      "relational": false,
+      "waiver_eligibility": "baseline-comparison-only",
+      "sources": [
+        {"minor": "1.35", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2582-2584"},
+        {"minor": "1.36", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2575-2577"},
+        {"minor": "1.37", "path": "pkg/apis/core/validation/validation.go", "symbol": "ValidatePersistentVolumeClaimUpdate", "lines": "2609-2611"}
       ]
     },
     {
