@@ -520,9 +520,10 @@ env: extra.env
         (sigs.k8s.io/yaml runs the stdlib JSON decoder), so ``Path:`` in a
         plugin configuration and ``Resources:`` in a kustomization populate
         the real fields while case-sensitive validation would never see
-        them. Both spellings are rejected before any subprocess runs,
-        proven with a bounded local listener that would record any request
-        the render tried to make."""
+        them; the decoder also folds U+017F (long s) onto 's' for
+        s-bearing field names. All spellings are rejected before any
+        subprocess runs, proven with a bounded local listener that would
+        record any request the render tried to make."""
         hits: list[str] = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -579,6 +580,22 @@ env: extra.env
                        f"Resources:\n  - http://127.0.0.1:{port}/remote-base\n")
             repo.commit("case-variant kustomization field")
             result, report = repo.check([base], outputs.parent / "reports-2",
+                                        cache=tool_cache)
+            assert result.returncode == 2
+            assert report["status"] == "error"
+            assert "must be spelled 'resources'" in joined_errors(report)
+
+            # Unicode-folded kustomization field: "re" + U+017F (long s)
+            # + "ources" decodes into the resources list through the Go
+            # decoder's equalFoldRight fold, which plain lowercasing never
+            # sees — rejected the same way, with no request issued.
+            unicode_resources = "re" + chr(0x017F) + "ources"
+            repo.write("manifests/overlays/prod/kustomization.yaml",
+                       "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                       "kind: Kustomization\n"
+                       f"{unicode_resources}:\n  - http://127.0.0.1:{port}/remote-base\n")
+            repo.commit("unicode-folded kustomization field")
+            result, report = repo.check([base], outputs.parent / "reports-3",
                                         cache=tool_cache)
             assert result.returncode == 2
             assert report["status"] == "error"

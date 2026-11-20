@@ -213,26 +213,76 @@ _KUSTOMIZATION_ENTRY_FIELDS: dict[str, frozenset[str]] = {
 }
 
 
+_KELVIN_SIGN = chr(0x212A)     # U+212A KELVIN SIGN
+_SMALL_LONG_ESS = chr(0x017F)  # U+017F LATIN SMALL LETTER LONG S
+
+
+def _go_json_fold_matches(key: str, field: str) -> bool:
+    """Whether the pinned kustomize decodes ``key`` into struct field ``field``.
+
+    Replicates the fold selection of the encoding/json fork vendored inside
+    sigs.k8s.io/yaml@v1.6.0 (fields.go ``foldFunc``), which is what decodes
+    kustomization and plugin documents into Go structs. Field names are the
+    ASCII JSON tags (every allowlist entry is pure ASCII letters), so:
+
+    * an ASCII ``key`` matches only case-insensitively (all three ASCII fold
+      functions agree for all-letter field names), while
+    * a ``key`` containing U+017F (long s) or U+212A (Kelvin sign)
+      additionally matches a field holding 's'/'S' or 'k'/'K' at that
+      position — but only when the field name contains one of those letters
+      at all, because that is what selects ``equalFoldRight``; fields without
+      k/K/s/S fold ASCII-only and can never be populated by a non-ASCII key.
+
+    Python's ``str.lower`` does not implement this (the long s lowercases
+    to itself), which is why the check cannot simply lowercase both sides.
+    """
+    if key == field:
+        return True
+    if key.isascii():
+        return key.lower() == field.lower()
+    if not any(char in "kKsS" for char in field):
+        return False
+    if len(key) != len(field):
+        return False
+    for key_char, field_char in zip(key, field):
+        if key_char == _SMALL_LONG_ESS:
+            if field_char not in "sS":
+                return False
+        elif key_char == _KELVIN_SIGN:
+            if field_char not in "kK":
+                return False
+        elif key_char.isascii():
+            if ("a" <= field_char <= "z") or ("A" <= field_char <= "Z"):
+                if key_char.lower() != field_char.lower():
+                    return False
+            elif key_char != field_char:
+                return False
+        else:
+            return False
+    return True
+
+
 def _reject_case_folded_keys(mapping: Mapping[str, Any],
                              field_names: frozenset[str], where: str) -> None:
-    """Reject keys that match kustomize struct fields only case-insensitively.
+    """Reject keys that match kustomize struct fields only by folding.
 
     Complements the case-sensitive readers: any key the pinned kustomize
     would decode into a struct field must carry that field's exact canonical
     spelling, or the reference validation reading the lowercase name would
-    never see it.
+    never see it. Folding follows the Go decoder exactly, including the
+    Unicode equivalents of 's' and 'k' (U+017F, U+212A) that a plain
+    lowercasing comparison misses.
     """
-    lowered = {name.lower(): name for name in field_names}
     for key in mapping:
         if not isinstance(key, str):
             continue
-        canonical = lowered.get(key.lower())
-        if canonical is not None and key != canonical:
-            raise RenderError(
-                f"{where}: field {key!r} must be spelled {canonical!r}; the pinned "
-                "kustomize matches YAML keys case-insensitively, so a differently "
-                "cased spelling would bypass input validation"
-            )
+        for canonical in field_names:
+            if _go_json_fold_matches(key, canonical) and key != canonical:
+                raise RenderError(
+                    f"{where}: field {key!r} must be spelled {canonical!r}; the pinned "
+                    "kustomize matches YAML keys case-insensitively, so a differently "
+                    "cased spelling would bypass input validation"
+                )
 
 _GO_VERSION_RE = re.compile(r"go(\d+)\.(\d+)(?:\.(\d+))?")
 _LONG_TOKEN_RE = re.compile(r"[A-Za-z0-9+/=]{40,}")
@@ -1476,14 +1526,96 @@ def _reject_hazardous_ancestors(snapshot: _Snapshot, rel: str, what: str) -> Non
             )
 
 
-def _static_glob_prefix(pattern: str) -> str:
-    """The glob-free leading directory prefix of a source pattern."""
-    prefix: list[str] = []
-    for part in PurePosixPath(pattern).parts:
-        if _GLOB_CHARS.search(part):
-            break
-        prefix.append(part)
-    return "/".join(prefix)
+def _glob_tokens(pattern: str) -> list[tuple[str, str]]:
+    """Split an fnmatch pattern into literal/star/any/class tokens."""
+    tokens: list[tuple[str, str]] = []
+    literal: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if literal:
+                tokens.append(("lit", "".join(literal)))
+                literal = []
+            tokens.append(("star", ""))
+            index += 1
+        elif char == "?":
+            if literal:
+                tokens.append(("lit", "".join(literal)))
+                literal = []
+            tokens.append(("any", ""))
+            index += 1
+        elif char == "[":
+            close = pattern.find("]", index + 1)
+            if close == -1:
+                literal.append(char)  # unclosed bracket is a literal, as in fnmatch
+                index += 1
+                continue
+            if literal:
+                tokens.append(("lit", "".join(literal)))
+                literal = []
+            tokens.append(("class", pattern[index:close + 1]))
+            index = close + 1
+        else:
+            literal.append(char)
+            index += 1
+    if literal:
+        tokens.append(("lit", "".join(literal)))
+    return tokens
+
+
+def _glob_could_match_under(pattern: str, prefix: str) -> bool:
+    """Whether any string starting with ``prefix`` matches the glob ``pattern``.
+
+    Exact decision for the fnmatch syntax: the pattern's tokens must be able
+    to consume ``prefix``, stopping anywhere — a token left partially
+    consumed at the end of ``prefix`` is completed by the arbitrary suffix,
+    and every fnmatch token is satisfiable by some string. Used to detect
+    snapshot hazards whose hidden descendants could have matched a source
+    pattern (the hazard itself matching the pattern exactly is checked
+    separately): a hazard that could contain matches must never let the
+    source set look absent.
+    """
+    tokens = _glob_tokens(pattern)
+    memo: dict[tuple[int, int], bool] = {}
+
+    def consume(index: int, position: int) -> bool:
+        state = (index, position)
+        if state in memo:
+            return memo[state]
+        if position == len(prefix):
+            result = True
+        elif index == len(tokens):
+            result = False
+        else:
+            kind, value = tokens[index]
+            if kind == "star":
+                result = any(
+                    consume(index + 1, nxt)
+                    for nxt in range(position, len(prefix) + 1)
+                )
+            elif kind == "any":
+                result = consume(index + 1, position + 1)
+            elif kind == "class":
+                result = (
+                    fnmatch.fnmatchcase(prefix[position], value)
+                    and consume(index + 1, position + 1)
+                )
+            else:
+                run = 0
+                while (run < len(value) and position + run < len(prefix)
+                       and value[run] == prefix[position + run]):
+                    run += 1
+                if position + run == len(prefix):
+                    result = True  # suffix completes the literal
+                elif run == len(value):
+                    result = consume(index + 1, position + len(value))
+                else:
+                    result = False
+        memo[state] = result
+        return result
+
+    return consume(0, 0)
 
 
 def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
@@ -1500,23 +1632,24 @@ def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
         pattern = _validate_repo_relative(
             pattern, f"scenario {scenario_id!r} sources entry", allow_glob=True
         )
-        # An ancestor of the pattern's static prefix that is a hazard hides
-        # every file the pattern could match: that is uninspectable content,
-        # not an absent source set.
-        prefix = _static_glob_prefix(pattern)
-        if prefix:
-            _reject_hazardous_ancestors(
-                snapshot, prefix, f"scenario {scenario_id!r} source pattern prefix",
-            )
-        hazards = sorted(
-            file for file in snapshot.hazards if fnmatch.fnmatchcase(file, pattern)
-        )
-        if hazards:
-            hazard = snapshot.hazards[hazards[0]]
-            raise RenderError(
-                f"scenario {scenario_id!r}: matched input {hazards[0]!r} cannot be safely "
-                f"materialized ({hazard.get('hazard')})"
-            )
+        # A hazard that matches the pattern exactly cannot be materialized;
+        # a hazard whose hidden descendants could match the pattern makes the
+        # source set uninspectable — never an absent (authorizable) set. The
+        # under-check is exact: it subsumes ancestors of the static prefix
+        # and provably unreachable hazards stay legitimate absence.
+        for hazard_path in sorted(snapshot.hazards):
+            hazard = snapshot.hazards[hazard_path]
+            if fnmatch.fnmatchcase(hazard_path, pattern):
+                raise RenderError(
+                    f"scenario {scenario_id!r}: matched input {hazard_path!r} cannot be "
+                    f"safely materialized ({hazard.get('hazard')})"
+                )
+            if _glob_could_match_under(pattern, hazard_path + "/"):
+                raise RenderError(
+                    f"scenario {scenario_id!r}: input {hazard_path!r} cannot be "
+                    f"inspected ({hazard.get('hazard')}); files it hides could "
+                    f"match source pattern {pattern!r}"
+                )
         hits = sorted(
             file for file in snapshot.files if fnmatch.fnmatchcase(file, pattern)
         )

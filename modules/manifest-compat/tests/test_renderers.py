@@ -2051,6 +2051,66 @@ class TestKustomizeRender:
             monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
         )
 
+    def test_unicode_folded_field_spellings_are_rejected(self, tmp_path: Path) -> None:
+        # The Go decoder vendored by sigs.k8s.io/yaml folds U+017F (long s)
+        # onto s/S and U+212A (Kelvin sign) onto k/K at any position for
+        # field names holding those letters (equalFoldRight), and Python's
+        # str.lower() sees neither: these spellings populate the real fields
+        # in the pinned kustomize while a lowercasing guard would pass them.
+        resources_key = "re" + chr(0x017F) + "ources"
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                "kind: Kustomization\n"
+                f"{resources_key}:\n  - https://example.invalid/base\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="must be spelled 'resources'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+        files_key = "File" + chr(0x017F)
+        repo = build_repo(tmp_path, name="repo-files", files={
+            "manifests/overlays/prod/kustomization.yaml":
+                f"configMapGenerator:\n  - name: cfg\n    {files_key}: [a.yaml]\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path, name="snap-files")
+        with pytest.raises(RenderError, match="must be spelled 'files'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+        kind_key = chr(0x212A) + "ind"
+        repo = build_repo(tmp_path, name="repo-kind", files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+                f"{kind_key}: Kustomization\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path, name="snap-kind")
+        with pytest.raises(RenderError, match="must be spelled 'kind'"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_non_folding_non_ascii_keys_stay_legal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # "path" holds no k/K/s/S, so the Go decoder folds it ASCII-only
+        # (equalFoldRight is never selected) and a non-ASCII lookalike key
+        # cannot populate it: the pinned kustomize ignores the key entirely
+        # (non-strict decode), so it stays legal and its value is never a
+        # validated reference.
+        path_key = "p" + chr(0xE5) + "th"
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "transformers:\n  - transformers.yaml\n",
+            "manifests/overlays/prod/transformers.yaml": (
+                "apiVersion: builtin\nkind: PatchTransformer\nmetadata:\n"
+                f"  name: patch\n{path_key}: https://example.invalid/patch.yaml\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+
     def test_nested_plugin_second_document_validated(self, tmp_path: Path) -> None:
         # Every document in a multi-document configuration stream is
         # checked, not just the first.
@@ -2368,6 +2428,31 @@ class TestRawRender:
         records, _ = snap_candidate(repo, tmp_path)
         with pytest.raises(RenderError, match="cannot be inspected"):
             renderers.render(records, raw_scenario(["manifests/*.yaml"]), None)
+
+    def test_hazardous_glob_descendant_is_not_an_absent_source(self, tmp_path: Path) -> None:
+        # A gitlink under the glob's static prefix but off the exact
+        # pattern ("manifests/app" does not match "manifests/*/
+        # deployment.yaml"): files it hides could still have matched, so
+        # the source set is uninspectable content, never a wholly absent
+        # (authorizable) one.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        commit_extra_file(repo, "manifests/app", "", mode="160000", working_copy=False)
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be inspected"):
+            renderers.render(records, raw_scenario(["manifests/*/deployment.yaml"]), None)
+
+    def test_unreachable_glob_hazard_stays_absence(self, tmp_path: Path) -> None:
+        # Exactness of the descendant check: the pattern provably matches
+        # nothing under the hazard ("app" cannot start with "x"), so the
+        # source set is legitimately absent — the check must not
+        # over-reject it into an integrity error.
+        repo = build_repo(tmp_path, files={"unrelated.yaml": "x: 1\n"})
+        commit_extra_file(repo, "manifests/app", "", mode="160000", working_copy=False)
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(MissingInputError) as excinfo:
+            renderers.render(records, raw_scenario(["manifests/x*/deployment.yaml"]), None)
+        assert excinfo.value.missing == ["manifests/x*/deployment.yaml"]
+        assert excinfo.value.matched == []
 
     def test_escaped_sources_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"a.yaml": "kind: A\n"})
